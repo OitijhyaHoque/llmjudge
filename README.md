@@ -21,16 +21,37 @@ python3 -m pip install -r requirements.txt
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 19 tests, ~18s, no server needed
-python3 -m llmjudge --prompt c3 --pool pilot --run-tag smoke-01 \
-    --run-dir ../judge-0/runs/split-ctgan-e300-gpu --dry-run
+python3 -m unittest discover -s tests -t .            # 21 tests, ~18s, no server needed
+python3 -m llmjudge --items items.jsonl --out out/pilot \
+    --prompt c3 --run-tag pilot-01 --dry-run
 ```
 
 `--dry-run` renders the first prompt, prints it, and sends nothing. Always the first step
 against a new prompt or a new endpoint.
 
-`--run-dir` is temporary: until step 2 below, the pool is still read from a judge-0 run
-directory rather than from an items file.
+## The interface
+
+**In** — one JSONL, one object per row:
+
+```json
+{"id": "ctgan_split:41772", "fields": {"age": "[70-80)", "diag_1": "250.83"},
+ "group": "kept", "stratum": "accept/label=1", "weight": 2399.75}
+```
+
+| key | | |
+|---|---|---|
+| `id` | required | unique; the only thing tying a verdict back to a row, and never parsed here |
+| `fields` | required | the `{column}` substitutions for `prompts/<name>/user.md` |
+| `group`, `stratum` | optional | opaque labels that bucket `summary.json`; nothing here reads their meaning |
+| `weight` | optional, 1.0 | for the weighted rates, so a caller that sampled strata unequally can still report a population rate |
+
+**Out** — `<out>/results.jsonl`, append-only, one object per final answer: `id`, `verdict`,
+`short_reason`, `reasoning`, the endpoint and model, the prompt and schema shas, latency and
+token counts, and `error` / `parse_error` where there is one. Errors are recorded, never
+dropped, so a re-run retries exactly them.
+
+Building the items file is the caller's job, deliberately: stratifying a pool needs to know
+what a rule decided, and this repository holds no rules.
 
 ## Layout
 
@@ -39,7 +60,6 @@ llmjudge/
 ├── llmjudge/
 │   ├── run.py        the judge: endpoint pool, retries, breakers, resume, summary
 │   ├── prompts.py    {column} substitution, and the refusal when a column is missing
-│   ├── tables.py     CSV in, one numeric parse
 │   └── __main__.py   python3 -m llmjudge
 ├── prompts/<name>/   system.md + user.md — c1, c1r, c2, c2-reason-first, c3,
 │                     c3-reasoning, c3-reasoning-2
@@ -58,9 +78,9 @@ Everything below is already implemented and covered by `tests/test_run.py`.
 A restart skips every row already recorded. `--retry-errors` re-sends only the rows whose
 latest record is an error.
 
-**Refusal on a changed run.** `<out>/run.json` pins prompt, schema, decoding, pool and
-inputs. A restart into that directory with any of them changed is refused rather than
-quietly mixing two arms in one file.
+**Refusal on a changed run.** `<out>/run.json` pins the prompt, the schema, the decoding
+settings, the send-order seed and the items file's sha. A restart into that directory with
+any of them changed is refused rather than quietly mixing two pools in one file.
 
 **Endpoints that come and go.** Connection errors, `ERR_NGROK_*`, 502/503/504 and
 Cloudflare 520–527 pause an endpoint; `/v1/models` and a canary are re-probed with
@@ -73,8 +93,11 @@ run. In shard mode the other endpoints drain the queue meanwhile.
 when a step buys nothing, and halves on 429 or timeout. Bounds come from the endpoints
 file; keep `max_concurrency` at or below vLLM's `--max-num-seqs`.
 
-**Preflight.** Before any row: `/v1/models` must list the configured model, and a canary
-request must come back sound. Under guided decoding the canary's schema admits one value,
+**Preflight.** The whole items file is parsed and checked before a single request goes
+out — ids present and unique, `fields` an object, and the prompt's `{column}` placeholders
+all present — so a pool malformed on line 40,000 costs nothing rather than four hours. Then,
+per endpoint: `/v1/models` must list the configured model, and a canary request must come
+back sound. Under guided decoding the canary's schema admits one value,
 so a server silently ignoring `response_format` is refused rather than producing a run of
 unconstrained replies.
 
@@ -99,14 +122,17 @@ anyway, so a fixed key bought nothing and could only leak.
 
 ## What is still to do
 
-This is step 1 of `notes/20260921_044121-judge-plan.md` — the extraction. Two things the
-plan changes next, and this README will be wrong about until it does:
+Steps 1 and 2 of `notes/20260921_044121-judge-plan.md` are done: the extraction, and the
+items interface. What the plan changes next:
 
-1. **The pool still comes from rules.** `run.py`'s `GROUPS`/`SIZES` still read
-   `rules/<arm>/decisions.csv` and the diabetes130 column names `kept`, `decision`,
-   `checks`. Step 2 replaces that with **items JSONL in, verdicts JSONL out**, and moves
-   pool construction and stratification to `judge-0/pipeline/judge_stage.py`, where the
-   rule-aware code belongs. `notebooks/judge_local.py` is the shape it becomes.
-2. **The Colab path is not here yet.** Step 5 adds `llmjudge/colab.py`: mount Drive, pull
+1. **Nobody writes the items file yet.** Step 3 moves pool construction and stratification
+   into `judge-0/pipeline/judge_stage.py`, which writes items and reads verdicts. Until
+   then a caller emits the JSONL itself.
+2. **One provider shape.** Step 4 adds `providers.py`: the OpenAI-compatible path stays the
+   default, and an Anthropic adapter joins it for the frontier-model comparison.
+3. **The Colab path is not here yet.** Step 5 adds `llmjudge/colab.py`: mount Drive, pull
    any partial results down to resume, run against localhost, mirror the tail back every
    100 s, verify the copy at exit. No bundles and no zips.
+
+Runs made before the items interface keyed resume on `(table sha, arm, row index)`. They do
+not resume here, by decision; their `results.jsonl` stays readable.

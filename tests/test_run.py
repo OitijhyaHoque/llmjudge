@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import csv
 import io
 import json
 import os
@@ -34,11 +33,14 @@ MODEL = "mock/medgemma"
 with open(os.path.join(ROOT, "prompts", "c2", "user.md"), encoding="utf-8") as _f:
     COLUMNS = re.findall(r"\{([^{}\s]+)\}", _f.read())
 
-# ctgan_split: 0-39 accept, 40-44 pending, 45-52 sex rejects, 53-57 age rejects, 58-59 other.
-# real_test: 0-27 accept, 28-29 reject. Full custom pool = 45 + 13 + 28 = 86 rows.
-POOL_ROWS = 86
-SLOW = {3, 11, 19, 27}           # ctgan rows with time_in_hospital 14
-BAD = 5                          # ctgan row the mock answers with HTTP 400
+# The items file stands in for whatever a caller's rule stage produced. Its group and
+# stratum labels are opaque strings here on purpose: this repository never reads them.
+#   kept      ctgan_split 0-44    0-39 "accept", 40-44 "pending"
+#   positive  ctgan_split 45-57   45-52 sex rejects (gender Male + diag_1 650), 53-57 age
+#   test      real_test 0-27
+POOL_ROWS = 45 + 13 + 28         # 86
+SLOW = {"ctgan_split:3", "ctgan_split:11", "ctgan_split:19", "ctgan_split:27"}
+BAD = "ctgan_split:5"            # the item the mock answers with HTTP 400
 
 
 # --------------------------------------------------------------------------------------
@@ -154,47 +156,36 @@ def base_row(i: int, **over) -> dict:
     return r
 
 
-def write_arm(run: str, arm: str, rows: list[dict], decisions: list[tuple[str, str]]):
-    os.makedirs(os.path.join(run, "normalize", arm))
-    os.makedirs(os.path.join(run, "rules", arm))
-    with open(os.path.join(run, "normalize", arm, "table.csv"), "w", newline="") as f:
-        w = csv.DictWriter(f, COLUMNS)
-        w.writeheader()
-        w.writerows(rows)
-    with open(os.path.join(run, "rules", arm, "decisions.csv"), "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["index", "decision", "action", "stage", "kept", "checks",
-                    "defect_classes", "columns"])
-        for i, (decision, checks) in enumerate(decisions):
-            w.writerow([i, decision, "use", "clean", "0" if decision == "reject" else "1",
-                        checks, "", ""])
-
-
-def write_fixture(root: str) -> str:
-    run = os.path.join(root, "run")
-    rows, decs = [], []
-    for i in range(60):
+def write_items(root: str) -> str:
+    """One JSONL, the only input the judge takes."""
+    items = []
+    for i in range(58):
+        item_id = f"ctgan_split:{i}"
         over = {}
-        if i in SLOW:
+        if item_id in SLOW:
             over["time_in_hospital"] = "14"
-        if i == BAD:
+        if item_id == BAD:
             over["diag_1"] = "BAD400"
+        label = str(i % 2)
         if i < 40:
-            decs.append(("accept", ""))
+            group, stratum, weight = "kept", f"accept/label={label}", 1.0
         elif i < 45:
-            decs.append(("pending", "kb.duplicate_class"))
+            group, stratum, weight = "kept", f"pending/label={label}", 1.0
         elif i < 53:
-            decs.append(("reject", "kb.sex_diagnosis"))
             over.update(gender="Male", diag_1="650")
-        elif i < 58:
-            decs.append(("reject", "kb.age_diagnosis"))
+            group, stratum, weight = "positive", "kb.sex_diagnosis", 2.0
         else:
-            decs.append(("reject", "book.change_no_but_titrated"))
-        rows.append(base_row(i, **over))
-    write_arm(run, "ctgan_split", rows, decs)
-    write_arm(run, "real_test", [base_row(i) for i in range(30)],
-              [("accept", "")] * 28 + [("reject", "range.number_outpatient")] * 2)
-    return run
+            group, stratum, weight = "positive", "kb.age_diagnosis", 2.0
+        items.append({"id": item_id, "group": group, "stratum": stratum, "weight": weight,
+                      "fields": base_row(i, **over)})
+    for i in range(28):
+        items.append({"id": f"real_test:{i}", "group": "test", "stratum": f"label={i % 2}",
+                      "fields": base_row(i)})
+    path = os.path.join(root, "items.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it) + "\n")
+    return path
 
 
 def write_endpoints(root: str, port: int, quota: int = 0, concurrency: int = 4,
@@ -257,23 +248,51 @@ class PromptTests(unittest.TestCase):
                 cj.load_prompt(d)
 
 
-class PoolTests(unittest.TestCase):
-    def test_allocation(self):
-        self.assertEqual(cj.allocate({"a": 90, "b": 10}, 10, "proportional"), {"a": 9, "b": 1})
-        self.assertEqual(cj.allocate({"a": 90, "b": 3}, 10, "equal"), {"a": 7, "b": 3})
-        self.assertEqual(cj.allocate({"a": 5, "b": 3}, 0, "equal"), {"a": 5, "b": 3})
+class ItemsTests(unittest.TestCase):
+    """load_items is the only new parser, and it refuses whole files, never half of one."""
 
-    def test_pool_is_deterministic_and_small_pools_nest_in_large_ones(self):
+    def _write(self, d: str, *lines: str) -> str:
+        path = os.path.join(d, "items.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("".join(l + "\n" for l in lines))
+        return path
+
+    def test_order_is_seeded_and_independent_of_file_order(self):
         with tempfile.TemporaryDirectory() as d:
-            run = write_fixture(d)
-            small = cj.build_pool(run, {"kept": 5, "positive": 4, "test": 4}, 42)
-            again = cj.build_pool(run, {"kept": 5, "positive": 4, "test": 4}, 42)
-            large = cj.build_pool(run, {"kept": 10, "positive": 8, "test": 8}, 42)
-        self.assertEqual(small[3], again[3])
-        ids = lambda pool: {(it.group, it.arm, it.index) for it in pool[0]}  # noqa: E731
-        self.assertLessEqual(ids(small), ids(large))
-        strata = [it.stratum for it in small[0] if it.group == "positive"]
-        self.assertEqual(sorted(strata), ["kb.age_diagnosis"] * 2 + ["kb.sex_diagnosis"] * 2)
+            path = write_items(d)
+            a, sha_a, csv_a = cj.load_items(path, 42)
+            b, sha_b, csv_b = cj.load_items(path, 42)
+            c, _, csv_c = cj.load_items(path, 43)
+        self.assertEqual([i.id for i in a], [i.id for i in b])
+        self.assertEqual((sha_a, csv_a), (sha_b, csv_b))
+        self.assertNotEqual(csv_a, csv_c)                      # a different seed reorders
+        self.assertEqual(len(a), POOL_ROWS)
+        self.assertEqual({i.id for i in a}, {i.id for i in c})
+
+    def test_optional_labels_default_and_are_never_interpreted(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, json.dumps({"id": "x", "fields": {"a": "1"}}))
+            items, _, _ = cj.load_items(path, 42)
+        self.assertEqual((items[0].group, items[0].stratum, items[0].weight), ("", "", 1.0))
+
+    def test_a_malformed_file_is_refused_whole(self):
+        bad = {
+            "duplicate id": ['{"id": "a", "fields": {}}', '{"id": "a", "fields": {}}'],
+            "not JSON": ['{"id": "a", "fields": {}}', "{oops"],
+            '"id" must be': ['{"fields": {}}'],
+            '"fields" must be': ['{"id": "a"}'],
+            '"weight" must be': ['{"id": "a", "fields": {}, "weight": "heavy"}'],
+            "no items": [],
+        }
+        for expected, lines in bad.items():
+            with tempfile.TemporaryDirectory() as d, self.subTest(expected):
+                with self.assertRaises(cj.ConfigError) as cm:
+                    cj.load_items(self._write(d, *lines), 42)
+                self.assertIn(expected, str(cm.exception))
+
+    def test_missing_items_file(self):
+        with self.assertRaises(cj.ConfigError):
+            cj.load_items("/nonexistent/items.jsonl", 42)
 
 
 class TunerTests(unittest.TestCase):
@@ -308,7 +327,7 @@ class RunBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
-        self.run_dir = write_fixture(self.root)
+        self.items = write_items(self.root)
         self.out = os.path.join(self.root, "out")
         self.state = MockState()
         self.server = Server(self.state)
@@ -319,8 +338,8 @@ class RunBase(unittest.TestCase):
         self.tmp.cleanup()
 
     def judge(self, *extra: str, endpoints: str | None = None, prompt: str = "c2") -> int:
-        argv = ["--prompt", prompt, "--pool", "full", "--sizes", "kept=0,positive=0,test=0",
-                "--run-dir", self.run_dir, "--run-tag", "t", "--out", self.out,
+        argv = ["--prompt", prompt, "--items", self.items,
+                "--run-tag", "t", "--out", self.out,
                 "--endpoints", endpoints or write_endpoints(self.root, self.server.port),
                 "--timeout", "10", "--probe-min", "0.1", "--probe-max", "0.4",
                 "--give-up-after", "20", "--progress-every", "0.5", "--backoff-max", "0.2",
@@ -336,7 +355,7 @@ class RunBase(unittest.TestCase):
         recs = self.results
         self.assertEqual(len(recs), POOL_ROWS)
         self.assertEqual(len({r["key"] for r in recs}), POOL_ROWS)
-        self.assertEqual(len({(r["arm"], r["index"]) for r in recs}), POOL_ROWS)
+        self.assertEqual(len({r["id"] for r in recs}), POOL_ROWS)
 
 
 class RunTests(RunBase):
@@ -345,9 +364,9 @@ class RunTests(RunBase):
         self.assert_one_record_per_row()
         recs = self.results
         bad = [r for r in recs if r["error"]]
-        self.assertEqual([(r["arm"], r["index"], r["error"]["class"]) for r in bad],
-                         [("ctgan_split", BAD, "bad_request")])
-        sex = [r["verdict"] for r in recs if r["rules_checks"] == "kb.sex_diagnosis"]
+        self.assertEqual([(r["id"], r["error"]["class"]) for r in bad],
+                         [(BAD, "bad_request")])
+        sex = [r["verdict"] for r in recs if r["stratum"] == "kb.sex_diagnosis"]
         self.assertEqual(sex, ["inconsistent"] * 8)
         with open(os.path.join(self.out, "summary.json")) as f:
             summary = json.load(f)
@@ -363,8 +382,8 @@ class RunTests(RunBase):
         # 4 slow rows in batches of 8 would cost >= 4 x 1.5 s; a continuous window ~1.5 s.
         self.assertLess(wall, 4.0)
         self.assert_one_record_per_row()
-        order = [r["index"] for r in self.results if r["arm"] == "ctgan_split"]
-        self.assertTrue(all(i in SLOW for i in order[-len(SLOW):]))
+        order = [r["id"] for r in self.results]
+        self.assertEqual(set(order[-len(SLOW):]), SLOW)
 
     def test_endpoint_dies_mid_run_and_nothing_is_lost_or_duplicated(self):
         self.state.delay = 0.05

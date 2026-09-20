@@ -5,4 +5,4 @@ dataset-specific column names: those live in `rule-builder` (authoring) and `jud
 (execution and the evaluation pipeline). The interface across that line is files.
 """
 
-__all__ = ["run", "prompts", "tables"]
+__all__ = ["run", "prompts"]

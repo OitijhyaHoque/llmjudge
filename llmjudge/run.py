@@ -77,38 +77,47 @@ refuses an endpoint whose first 20 replies all fail parsing does the rest.
 Resume
     `<out>/results.jsonl` is append-only, one line per final answer, flushed per line and
     fsync'd every 50. A restart skips every row already recorded; `--retry-errors` re-sends
-    rows whose latest record is an error or a parse error. The resume key is (input table
-    sha, arm, row index, model, prompt sha, schema sha or "guided=off"), plus the endpoint in
-    compare mode.
+    rows whose latest record is an error or a parse error. The resume key is (items file sha,
+    item id, model, prompt sha, schema sha or "guided=off"), plus the endpoint in compare
+    mode. Runs made before the items interface used (table sha, arm, row index) instead and
+    do not resume here; their results.jsonl stays readable.
     `<out>/run.json` pins prompt, schema, decoding, pool and inputs; a restart with any of
     them changed is refused. Ctrl-C once: stop sending, let in-flight requests finish,
     write the summary. Twice: exit now (every recorded line is already on disk).
 
-Pools (row sources: `<run-dir>/normalize/<arm>/table.csv` + `rules/<arm>/decisions.csv`)
-    kept       ctgan_split rows the hard rules kept      pilot 50   full all (52,539)
-    positive   ctgan_split rows rejected by kb.sex_diagnosis / kb.age_diagnosis
-                                                         pilot 25   full 500
-    test       real_test rows the hard rules kept        pilot 25   full 2,000
-    `kept` and `test` are stratified proportionally ((decision, label) and label), and
-    `positive` equally over the two checks, each stratum shuffled by --seed. The pilot is
-    a subset of the full pool. Rows are sent in one seeded shuffled order, so any prefix
-    of a run is a random sample of the pool. Every row carries weight = stratum size /
-    rows taken from it.
+Items (`--items`, one JSON object per line)
+
+    {"id": "ctgan_split:41772", "fields": {"age": "[70-80)", "diag_1": "250.83", ...}}
+
+    id      required, unique. It is the only thing tying a verdict back to a row, and this
+            script never parses it.
+    fields  required. Handed to `prompts/<prompt>/user.md` as `{column}` substitutions; a
+            template naming a field the item lacks is refused before anything is sent.
+    group,  optional, opaque. They only bucket `summary.json`; nothing here reads their
+    stratum meaning. A caller that filters rows with rules puts its own labels here.
+    weight  optional, default 1.0. Used for the weighted rates in the summary, so a caller
+            that sampled strata unequally can still report a population rate.
+
+    Rows are sent in one seeded shuffled order, so any prefix of a run is a random sample
+    of the items file. Nothing else about the items is interpreted: the model never sees
+    the id, the group, or anything but the rendered `fields`.
+
+    Building the items file is the caller's job, deliberately. Stratifying a pool needs to
+    know what a rule decided, and this repository holds no rules.
 
 Modes
     shard      one shared queue, every endpoint pulls from it; all must serve one model.
     compare    every row to every endpoint (e.g. MedGemma vs a general model). With two
                replicas of one model, `--mode compare --limit 200` is the agreement check.
 
-    python3 -m llmjudge --prompt c3 --pool pilot --run-tag c3-pilot-01 --dry-run
-    python3 -m llmjudge --prompt c3 --pool pilot --run-tag c3-pilot-01
-    python3 -m llmjudge --prompt c3-reasoning --guided off --pool pilot \\
-        --run-tag c3-reasoning-pilot-01
-    nohup python3 -m llmjudge --prompt c3-reasoning --guided off --pool full \\
-        --run-tag c3r-full-01 \\
-        >> runs/split-ctgan-e300-gpu/c2/c3r-full-01.log 2>&1 &
+    python3 -m llmjudge --items items.jsonl --out out/c3-pilot --prompt c3 \\
+        --run-tag c3-pilot-01 --dry-run
+    python3 -m llmjudge --items items.jsonl --out out/c3-pilot --prompt c3 \\
+        --run-tag c3-pilot-01
+    nohup python3 -m llmjudge --items items.jsonl --out out/c3r-full --prompt c3-reasoning \\
+        --guided off --run-tag c3r-full-01 >> out/c3r-full.log 2>&1 &
 
-Outputs in `<out>` (default `<run-dir>/c2/<run-tag>`): pool.csv, run.json, results.jsonl,
+Outputs in `<out>`: order.csv, run.json, results.jsonl,
 summary.json, endpoints.json, prompt_example.txt, request_example.json, judge.pid.
 Exit codes: 0 every planned row recorded, 2 configuration refused, 3 stopped incomplete.
 """
@@ -139,36 +148,20 @@ import httpx
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-from .prompts import render_user
-from .tables import iter_rows
+from .prompts import PLACEHOLDER, render_user
 
 VERDICTS = ("consistent", "inconsistent", "unsure")
 KEYS = ("verdict", "short_reason")
 CANARY = "canary-ok"
-POSITIVE_CHECKS = ("kb.sex_diagnosis", "kb.age_diagnosis")
 HEADERS = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
 NGROK_CODE = re.compile(r"ERR_NGROK_\d+")
 FIRST = re.compile(r'write "(\w+)" FIRST')
 WAITING = re.compile(r"^vllm:num_requests_waiting(?:\{[^}]*\})?\s+([0-9.eE+-]+)", re.M)
 THOUGHT = re.compile(r"<unused94>.*?(?:<unused95>|$)", re.S)   # MedGemma's thinking span
 
-GROUPS = {
-    "kept": {"arm": "ctgan_split", "alloc": "proportional",
-             "select": lambda d: d["kept"] == "1",
-             "stratum": lambda d, label: f"{d['decision']}/label={label}"},
-    "positive": {"arm": "ctgan_split", "alloc": "equal",
-                 "select": lambda d: d["decision"] == "reject" and d["checks"] in POSITIVE_CHECKS,
-                 "stratum": lambda d, label: d["checks"]},
-    "test": {"arm": "real_test", "alloc": "proportional",
-             "select": lambda d: d["kept"] == "1",
-             "stratum": lambda d, label: f"label={label}"},
-}
-SIZES = {"pilot": {"kept": 50, "positive": 25, "test": 25},
-         "full": {"kept": 0, "positive": 500, "test": 2000}}      # 0 = every eligible row
+ORDER_FIELDS = ["order", "id", "group", "stratum", "weight"]
 
 EXIT_OK, EXIT_CONFIG, EXIT_INCOMPLETE = 0, 2, 3
-POOL_FIELDS = ["order", "group", "stratum", "arm", "index", "label", "rules_decision",
-               "rules_checks", "weight"]
 
 
 class ConfigError(Exception):
@@ -205,7 +198,12 @@ def resolve(path: str) -> str:
 
 
 def rel(path: str) -> str:
-    return os.path.relpath(path, ROOT)
+    """Repo-relative when the path is inside the repo, absolute otherwise.
+
+    Items and results usually live outside the checkout -- on Drive, or on a share -- and
+    `../../../../mnt/...` in run.json helps nobody reading it later."""
+    r = os.path.relpath(path, ROOT)
+    return path if r.startswith("..") else r
 
 
 def quantile(values: list[float], p: float) -> float | None:
@@ -378,8 +376,8 @@ def build_payload(model: str, prompt: dict, user_text: str, decoding: dict,
 
 
 class Item:
-    __slots__ = ("group", "stratum", "arm", "index", "label", "decision", "checks", "weight",
-                 "row", "key", "attempts", "parse_retries", "auth_retried")
+    __slots__ = ("id", "fields", "group", "stratum", "weight",
+                 "key", "attempts", "parse_retries", "auth_retried")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -390,108 +388,62 @@ class Item:
         return Item(**{k: getattr(self, k) for k in self.__slots__ if k != "key"}, key=key)
 
 
-def allocate(sizes: dict[str, int], n: int, alloc: str) -> dict[str, int]:
-    """Rows to take per stratum. n <= 0 or n >= total takes everything."""
-    total = sum(sizes.values())
-    keys = sorted(sizes)
-    if n <= 0 or n >= total:
-        return dict(sizes)
-    if alloc == "equal":
-        take, left = dict.fromkeys(keys, 0), n
-        while left:
-            moved = False
-            for k in keys:
-                if left and take[k] < sizes[k]:
-                    take[k] += 1
-                    left -= 1
-                    moved = True
-            if not moved:
-                break
-        return take
-    exact = {k: n * sizes[k] / total for k in keys}
-    take = {k: min(sizes[k], math.floor(exact[k])) for k in keys}
-    left = n - sum(take.values())
-    for k in sorted(keys, key=lambda k: (-(exact[k] - math.floor(exact[k])), k)):
-        if left <= 0:
-            break
-        if take[k] < sizes[k]:
-            take[k] += 1
-            left -= 1
-    return take
+def load_items(path: str, seed: int) -> tuple[list[Item], str, str]:
+    """-> (items in send order, sha of the items file, order.csv text).
 
-
-def build_pool(run_dir: str, sizes: dict[str, int], seed: int
-               ) -> tuple[list[Item], dict[str, list[str]], dict, str]:
-    """-> (items in send order, header per arm, input provenance, pool.csv text)."""
-    by_arm: dict[str, list[str]] = collections.defaultdict(list)
-    for g, spec in GROUPS.items():
-        by_arm[spec["arm"]].append(g)
-
+    The file is read whole and checked whole before a single request goes out: a pool that
+    is malformed on line 40,000 should cost nothing, not four hours.
+    """
     items: list[Item] = []
-    headers: dict[str, list[str]] = {}
-    inputs: dict[str, dict] = {}
-    for arm, groups in sorted(by_arm.items()):
-        table = os.path.join(run_dir, "normalize", arm, "table.csv")
-        decisions = os.path.join(run_dir, "rules", arm, "decisions.csv")
-        for p in (table, decisions):
-            if not os.path.exists(p):
-                raise ConfigError(f"missing input {p}")
-        inputs[arm] = {"table": rel(table), "table_sha": file_sha(table),
-                       "decisions": rel(decisions), "decisions_sha": file_sha(decisions)}
+    seen: set[str] = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ConfigError(f"{path}:{lineno}: not JSON ({e})") from e
+                if not isinstance(obj, dict):
+                    raise ConfigError(f"{path}:{lineno}: expected an object, got {type(obj).__name__}")
+                item_id = obj.get("id")
+                if not isinstance(item_id, str) or not item_id:
+                    raise ConfigError(f'{path}:{lineno}: "id" must be a non-empty string')
+                if item_id in seen:
+                    raise ConfigError(f"{path}:{lineno}: duplicate id {item_id!r}")
+                seen.add(item_id)
+                fields = obj.get("fields")
+                if not isinstance(fields, dict):
+                    raise ConfigError(f'{path}:{lineno}: "fields" must be an object')
+                weight = obj.get("weight", 1.0)
+                if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                    raise ConfigError(f'{path}:{lineno}: "weight" must be a number')
+                items.append(Item(id=item_id, fields={k: v for k, v in fields.items()},
+                                  group=str(obj.get("group", "")),
+                                  stratum=str(obj.get("stratum", "")),
+                                  weight=float(weight)))
+    except FileNotFoundError as e:
+        raise ConfigError(f"missing items file {path}") from e
+    if not items:
+        raise ConfigError(f"{path}: no items")
 
-        strata: dict[str, dict[str, list[tuple]]] = {
-            g: collections.defaultdict(list) for g in groups}
-        try:
-            for i, (d, row) in enumerate(zip(iter_rows(decisions), iter_rows(table),
-                                             strict=True)):
-                if int(d["index"]) != i:
-                    raise ConfigError(f"{decisions}: line {i} has index {d['index']}")
-                label = row.get("label", "")
-                for g in groups:
-                    if GROUPS[g]["select"](d):
-                        strata[g][GROUPS[g]["stratum"](d, label)].append(
-                            (i, d["decision"], d["checks"], label))
-        except ValueError as e:
-            raise ConfigError(f"{arm}: decisions and table differ in length ({e})") from e
-
-        wanted: dict[int, list[Item]] = collections.defaultdict(list)
-        for g in groups:
-            st = strata[g]
-            take = allocate({k: len(v) for k, v in st.items()}, sizes[g], GROUPS[g]["alloc"])
-            for k in sorted(st):
-                rows = st[k]
-                random.Random(f"{seed}|{g}|{k}").shuffle(rows)
-                n = take.get(k, 0)
-                for i, decision, checks, label in rows[:n]:
-                    it = Item(group=g, stratum=k, arm=arm, index=i, label=label,
-                              decision=decision, checks=checks,
-                              weight=round(len(rows) / n, 6))
-                    wanted[i].append(it)
-                    items.append(it)
-        for i, row in enumerate(iter_rows(table)):
-            if i in wanted:
-                if arm not in headers:
-                    headers[arm] = list(row)
-                for it in wanted[i]:
-                    it.row = tuple(row.values())
-        headers.setdefault(arm, [])
-
-    items.sort(key=lambda it: (it.group, it.arm, it.index))
+    items.sort(key=lambda it: it.id)
     random.Random(f"{seed}|order").shuffle(items)
 
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow(POOL_FIELDS)
-    for n, it in enumerate(items):
-        w.writerow([n, it.group, it.stratum, it.arm, it.index, it.label, it.decision,
-                    it.checks, it.weight])
-    return items, headers, inputs, buf.getvalue()
+    w.writerow(ORDER_FIELDS)
+    for i, it in enumerate(items):
+        w.writerow([i, it.id, it.group, it.stratum, it.weight])
+    return items, file_sha(path), buf.getvalue()
 
 
-def row_key(input_sha: str, arm: str, index: int, model: str, prompt: dict,
+def row_key(items_sha: str, item_id: str, model: str, prompt: dict,
             endpoint: str = "", guided: bool = True) -> str:
-    """Guided, this is byte for byte c2_judge's key, so a c2 run resumes here untouched."""
-    return sha("|".join([input_sha, arm, str(index), model, prompt["prompt_sha"],
+    """What resume is keyed on. Changing any part of it means a row is sent again."""
+    return sha("|".join([items_sha, item_id, model, prompt["prompt_sha"],
                          prompt["schema_sha"] if guided else "guided=off", endpoint]))[:32]
 
 
@@ -519,10 +471,9 @@ def read_results(path: str) -> tuple[dict[str, dict], int, int]:
     return latest, n, bad
 
 
-PINNED = ("prompt", "prompt_sha", "schema_sha", "key_order", "guided", "decoding", "pool",
-          "sizes", "pool_seed", "pool_sha", "inputs", "mode")
-# Keys a run.json written by c2_judge.py cannot have; its runs were all guided.
-PINNED_DEFAULTS = {"guided": True}
+PINNED = ("prompt", "prompt_sha", "schema_sha", "key_order", "guided", "decoding",
+          "order_seed", "order_sha", "items_sha", "items_rows", "mode")
+PINNED_DEFAULTS: dict = {}
 
 
 def check_run_json(out: str, meta: dict, session: dict) -> None:
@@ -544,7 +495,7 @@ def check_run_json(out: str, meta: dict, session: dict) -> None:
 def summarise(results_path: str, meta: dict) -> dict:
     latest, lines, bad = read_results(results_path)
     recs = list(latest.values())
-    out: dict = {"prompt": meta["prompt"], "pool": meta["pool"], "mode": meta["mode"],
+    out: dict = {"prompt": meta["prompt"], "items": meta.get("items"), "mode": meta["mode"],
                  "rows": len(recs), "lines": lines, "unreadable_lines": bad,
                  "parse_errors": sum(bool(r.get("parse_error")) for r in recs),
                  "errors": dict(collections.Counter(
@@ -555,15 +506,15 @@ def summarise(results_path: str, meta: dict) -> dict:
                  "parse_notes": dict(collections.Counter(
                      r["parse_note"] for r in recs if r.get("parse_note"))),
                  "by_group": {}, "by_endpoint": {}}
-    for g in sorted({r["group"] for r in recs}):
-        rs = [r for r in recs if r["group"] == g]
+    for g in sorted({r.get("group") or "all" for r in recs}):
+        rs = [r for r in recs if (r.get("group") or "all") == g]
         judged = [r for r in rs if r.get("verdict")]
-        wsum = sum(r["weight"] for r in judged) or 1.0
+        wsum = sum(r.get("weight") or 1.0 for r in judged) or 1.0
 
         def share(verdicts, weighted):
             hit = [r for r in judged if r["verdict"] in verdicts]
             if weighted:
-                return round(sum(r["weight"] for r in hit) / wsum, 4)
+                return round(sum(r.get("weight") or 1.0 for r in hit) / wsum, 4)
             return round(len(hit) / max(1, len(judged)), 4)
 
         out["by_group"][g] = {
@@ -574,8 +525,8 @@ def summarise(results_path: str, meta: dict) -> dict:
             "inconsistent_or_unsure_rate": share({"inconsistent", "unsure"}, False),
             "inconsistent_rate_weighted": share({"inconsistent"}, True),
             "by_stratum": {s: dict(collections.Counter(r.get("verdict") or "not_judged"
-                                                       for r in rs if r["stratum"] == s))
-                           for s in sorted({r["stratum"] for r in rs})},
+                                                       for r in rs if r.get("stratum", "") == s))
+                           for s in sorted({r.get("stratum", "") for r in rs})},
         }
     for e in sorted({r["endpoint"] for r in recs}):
         rs = [r for r in recs if r["endpoint"] == e]
@@ -591,10 +542,10 @@ def summarise(results_path: str, meta: dict) -> dict:
             "prompt_tokens_p50": quantile(ptok, 0.5),
             "truncated": sum((r.get("error") or {}).get("class") == "length" for r in rs)}
     if meta["mode"] == "compare":
-        by_row: dict[tuple, dict[str, str]] = collections.defaultdict(dict)
+        by_row: dict[str, dict[str, str]] = collections.defaultdict(dict)
         for r in recs:
             if r.get("verdict"):
-                by_row[(r["arm"], r["index"])][r["endpoint"]] = r["verdict"]
+                by_row[r["id"]][r["endpoint"]] = r["verdict"]
         eps = sorted(out["by_endpoint"])
         pairs = {}
         for a_i, a in enumerate(eps):
@@ -995,12 +946,11 @@ class Endpoint:
 
 class Run:
     def __init__(self, args, prompt: dict, decoding: dict, meta: dict, out: str,
-                 items_by_ep: dict[str, list[Item]], shared: bool, headers: dict,
+                 items_by_ep: dict[str, list[Item]], shared: bool,
                  endpoint_cfgs: list[dict], quota: Quota, done: set[str],
                  canary_item: Item):
         self.args, self.prompt, self.decoding, self.meta, self.out = (
             args, prompt, decoding, meta, out)
-        self.headers = headers
         self.guided = args.guided == "on"
         self.quota = quota
         self.done = done
@@ -1028,7 +978,7 @@ class Run:
 
     # -- rendering and records -------------------------------------------------------
     def render(self, it: Item) -> str:
-        return render_user(self.prompt["user"], dict(zip(self.headers[it.arm], it.row)))
+        return render_user(self.prompt["user"], it.fields)
 
     def queues(self) -> list[collections.deque]:
         seen, out = set(), []
@@ -1050,14 +1000,12 @@ class Run:
         parsed = parsed or {}
         rec = {
             "key": it.key, "run_tag": self.args.run_tag, "session": self.session,
-            "group": it.group, "stratum": it.stratum, "arm": it.arm, "index": it.index,
-            "label": it.label, "rules_decision": it.decision, "rules_checks": it.checks,
-            "weight": it.weight,
+            "id": it.id, "group": it.group, "stratum": it.stratum, "weight": it.weight,
             "endpoint": ep.name, "model": ep.model, "prompt": self.prompt["name"],
             "prompt_sha": self.prompt["prompt_sha"], "schema_sha": self.prompt["schema_sha"],
             "guided": self.guided,
             "decoding": self.decoding, "extra": ep.extra or None,
-            "input_sha": self.meta["inputs"][it.arm]["table_sha"],
+            "items_sha": self.meta["items_sha"],
             "verdict": parsed.get("verdict"), "short_reason": parsed.get("short_reason"),
             "reasoning": parsed.get("reasoning"), "parse_note": parsed.get("parse_note"),
             "key_order_ok": parsed.get("key_order_ok"),
@@ -1075,7 +1023,7 @@ class Run:
         self.written += 1
         ep.stats["rows"] += 1
         ep.window.append(time.monotonic())
-        it.row = None
+        it.fields = None                       # the pool can be large; free it once recorded
 
     # -- one request -----------------------------------------------------------------
     async def backoff(self, it: Item, q: collections.deque, attempt: int) -> None:
@@ -1357,34 +1305,23 @@ def load_endpoints(path: str, only: list[str]) -> tuple[list[dict], str]:
         missing = [k for k in ("name", "url_key", "model") if not e.get(k)]
         if missing:
             raise ConfigError(f"{path}: endpoint {e.get('name')!r} lacks {missing}")
-    return eps, resolve(cfg.get("quota_file", "runs/c2_quota.json"))
-
-
-def parse_sizes(spec: str) -> dict[str, int]:
-    out = {}
-    for part in spec.split(","):
-        g, _, n = part.partition("=")
-        if g.strip() not in GROUPS:
-            raise ConfigError(f"--sizes group {g!r} not in {sorted(GROUPS)}")
-        out[g.strip()] = int(n)
-    return out
+    return eps, resolve(cfg.get("quota_file", "runs/quota.json"))
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--prompt", default="c2", help="directory under prompts/, or a path")
-    ap.add_argument("--pool", choices=sorted(SIZES), default="pilot")
-    ap.add_argument("--sizes", default="", help="override pool sizes: kept=50,positive=25,test=25"
-                                                " (0 = every eligible row)")
-    ap.add_argument("--seed", type=int, default=42, help="pool sampling and decoding seed")
-    ap.add_argument("--run-dir", default="runs/split-ctgan-e300-gpu")
+    ap.add_argument("--items", required=True,
+                    help="JSONL, one object per row: id, fields, and optionally group, "
+                         "stratum, weight")
+    ap.add_argument("--seed", type=int, default=42, help="send-order and decoding seed")
     ap.add_argument("--run-tag", required=True)
-    ap.add_argument("--out", default="", help="default <run-dir>/c2/<run-tag>")
+    ap.add_argument("--out", required=True, help="results directory")
     ap.add_argument("--endpoints", default="configs/endpoints.toml")
     ap.add_argument("--endpoint", action="append", default=[],
                     help="use only this endpoint (repeatable)")
     ap.add_argument("--mode", choices=["shard", "compare"], default="shard")
-    ap.add_argument("--limit", type=int, default=0, help="only the first N rows of the pool order")
+    ap.add_argument("--limit", type=int, default=0, help="only the first N rows of the send order")
     ap.add_argument("--retry-errors", action="store_true",
                     help="re-send rows whose latest record is an error or parse error")
     ap.add_argument("--guided", choices=["on", "off"], default="on",
@@ -1404,7 +1341,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                     help="seconds with every endpoint down before stopping")
     ap.add_argument("--progress-every", type=float, default=60.0)
     ap.add_argument("--dry-run", action="store_true",
-                    help="write pool, prompt and request examples; call nothing")
+                    help="write the send order, prompt and request examples; call nothing")
     return ap.parse_args(argv)
 
 
@@ -1422,19 +1359,15 @@ def run_main(args: argparse.Namespace) -> int:
     guided = args.guided == "on"
     if args.max_tokens is None:
         args.max_tokens = 96 if guided else 1024
-    sizes = dict(SIZES[args.pool])
-    pool_name = args.pool
-    if args.sizes:
-        sizes.update(parse_sizes(args.sizes))
-        pool_name = f"{args.pool}+custom"
-    run_dir = resolve(args.run_dir)
-    out = resolve(args.out) if args.out else os.path.join(run_dir, "c2", args.run_tag)
+    items_path = resolve(args.items)
+    out = resolve(args.out)
     decoding = {"temperature": args.temperature, "seed": args.seed,
                 "max_tokens": args.max_tokens}
 
-    items, headers, inputs, pool_csv = build_pool(run_dir, sizes, args.seed)
-    if not items:
-        raise ConfigError("the pool is empty")
+    items, items_sha, order_csv = load_items(items_path, args.seed)
+    missing = [k for k in PLACEHOLDER.findall(prompt["user"]) if k not in items[0].fields]
+    if missing:
+        raise ConfigError(f"prompt {prompt['name']!r} needs fields the items lack: {missing}")
     meta = {"prompt": prompt["name"], "prompt_dir": rel(prompt["dir"]),
             "prompt_sha": prompt["prompt_sha"], "key_order": list(prompt["order"]),
             "guided": guided,
@@ -1442,36 +1375,35 @@ def run_main(args: argparse.Namespace) -> int:
             # for, and it keeps the resume key the same as c2_judge's on the guided path.
             "schema": prompt["schema"] if guided else None,
             "schema_sha": prompt["schema_sha"],
-            "decoding": decoding, "pool": pool_name, "sizes": sizes, "pool_seed": args.seed,
-            "pool_sha": sha(pool_csv), "run_dir": rel(run_dir), "inputs": inputs,
+            "decoding": decoding, "order_seed": args.seed, "order_sha": sha(order_csv),
+            "items": rel(items_path), "items_sha": items_sha, "items_rows": len(items),
             "mode": args.mode}
     session = {"started": now_iso(), "argv": sys.argv[1:] if __name__ == "__main__" else None,
                "script_sha": file_sha(os.path.abspath(__file__)), "dry_run": args.dry_run,
                "pid": os.getpid()}
     os.makedirs(out, exist_ok=True)
     check_run_json(out, meta, session)
-    pool_path = os.path.join(out, "pool.csv")
-    with open(pool_path + ".tmp", "w", encoding="utf-8", newline="") as f:
-        f.write(pool_csv)
-    os.replace(pool_path + ".tmp", pool_path)
+    order_path = os.path.join(out, "order.csv")
+    with open(order_path + ".tmp", "w", encoding="utf-8", newline="") as f:
+        f.write(order_csv)
+    os.replace(order_path + ".tmp", order_path)
 
     counts = collections.Counter((it.group, it.stratum) for it in items)
-    log(f"pool {pool_name}: {len(items):,} rows -> {rel(pool_path)}")
-    for (g, s), n in sorted(counts.items()):
-        log(f"  {g:<9} {s:<28} {n:>6}")
+    log(f"items {rel(items_path)}: {len(items):,} rows -> {rel(order_path)}")
+    for (g, st), c in sorted(counts.items()):
+        log(f"  {g or '-':<9} {st or '-':<28} {c:>6}")
     log(f"prompt {prompt['name']}: key order {list(prompt['order'])}, guided decoding "
         f"{'on' if guided else 'off'}, max_tokens {args.max_tokens}, prompt sha "
         f"{prompt['prompt_sha'][:16]}, schema sha {prompt['schema_sha'][:16]}")
 
-    example = items[0]
-    user_text = render_user(prompt["user"], dict(zip(headers[example.arm], example.row)))
+    user_text = render_user(prompt["user"], items[0].fields)
     with open(os.path.join(out, "prompt_example.txt"), "w", encoding="utf-8") as f:
         f.write(f"=== SYSTEM ===\n{prompt['system']}\n\n=== USER ===\n{user_text}\n")
     write_json(os.path.join(out, "request_example.json"),
                build_payload("<model from the endpoints file>", prompt, user_text, decoding,
                              guided=guided))
     if args.dry_run:
-        log(f"dry run: no calls. Wrote pool.csv, run.json, prompt_example.txt, "
+        log(f"dry run: no calls. Wrote order.csv, run.json, prompt_example.txt, "
             f"request_example.json in {rel(out)}")
         return EXIT_OK
 
@@ -1488,8 +1420,7 @@ def run_main(args: argparse.Namespace) -> int:
     selected = items[:args.limit] if args.limit else items
 
     def key_for(it: Item, model: str, endpoint: str = "") -> str:
-        return row_key(inputs[it.arm]["table_sha"], it.arm, it.index, model, prompt, endpoint,
-                       guided)
+        return row_key(items_sha, it.id, model, prompt, endpoint, guided)
 
     if args.mode == "shard":
         model = ep_cfgs[0]["model"]
@@ -1503,9 +1434,8 @@ def run_main(args: argparse.Namespace) -> int:
             planned_keys |= {it.key for it in its}
             by_ep[e["name"]] = [it for it in its if it.key not in skip]
 
-    canary = next((it for it in items if it.group == "test"), items[0])
-    run = Run(args, prompt, decoding, meta, out, by_ep, args.mode == "shard", headers,
-              ep_cfgs, Quota(quota_file), done=skip & planned_keys, canary_item=canary)
+    run = Run(args, prompt, decoding, meta, out, by_ep, args.mode == "shard",
+              ep_cfgs, Quota(quota_file), done=skip & planned_keys, canary_item=items[0])
     run.planned = planned_keys
 
     pid_path = os.path.join(out, "judge.pid")
