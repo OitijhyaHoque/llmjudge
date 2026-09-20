@@ -224,3 +224,9 @@ __marimo__/
 # runs/ belongs in the repository. Keep the config, not the output.
 runs/
 out/
+
+# Judge output. Results belong on Drive, never in git.
+results/
+runs/
+*.jsonl
+.env

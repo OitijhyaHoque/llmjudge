@@ -1,0 +1,19 @@
+# One third-party dependency, and it is the HTTP client the judge sends requests with.
+#
+#     python3 -m pip install -r requirements.txt
+#     python3 -m unittest discover -s tests -t .      # 19 tests, ~18s, no server needed
+#
+# Requires Python 3.11 or newer (tomllib); developed on 3.12.3.
+httpx>=0.27
+
+# Everything else is standard library on purpose: the prompt loader (open), the config
+# reader (tomllib), the CSV reader (csv), the mock server (http.server) and the async
+# scheduler (asyncio). A colleague can read the whole request path without installing a
+# framework first.
+#
+# Optional, only for notebooks/judge_local.py, which is the readable reference loop:
+# openai>=1.0
+#
+# Optional, development only -- nothing here imports them:
+# pytest>=8.0          # the suite runs under both unittest and pytest
+# ruff>=0.6

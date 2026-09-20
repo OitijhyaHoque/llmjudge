@@ -1,0 +1,77 @@
+# Endpoints for llmjudge. Copy to configs/endpoints.toml and edit; the copy is yours,
+# this example is the one under version control.
+#
+# URLs and keys stay in .env; this file only names the keys, so it is safe to commit and
+# safe to paste into a ticket. Paths are relative to the repository root.
+#
+# concurrency       starting in-flight window; the script grows it while throughput rises
+# max_concurrency   ceiling; keep it at or below vLLM's --max-num-seqs. Requests above it
+#                   only queue inside vLLM, and behind Cloudflare the queue wait counts
+#                   toward the ~100 s after which the tunnel answers 524.
+# min_concurrency   floor after 429s / timeouts halve the window (default 1)
+# account, quota    requests are counted per account per UTC calendar month in quota_file,
+#                   preflight and probes included. 0 = not limited (Cloudflare, SSH).
+# metrics           poll vLLM /metrics every 10 s and stop growing while requests queue.
+#                   Only where requests are not capped.
+# extra             merged into every request body, e.g. for a thinking-capable model:
+#                   extra = { chat_template_kwargs = { enable_thinking = false } }
+# enabled = false   keep an entry without using it
+#
+# Every endpoint a run may use must be listed here when the run starts. Its URL may come
+# later: an endpoint whose url_key is not in its env file yet waits, and joins as soon as
+# the key appears (checked every few seconds).
+
+quota_file = "runs/quota.json"
+
+# ---- Colab notebooks: notebooks/serve_vllm.py, vLLM 0.29.0, --max-num-seqs 16,
+#      Cloudflare tunnel
+
+[[endpoint]]
+name = "colab-a"
+env_file = ".env"
+url_key = "MEDGEMMA_BASE_URL"
+auth_key = "MEDGEMMA_API_KEY"
+model = "medgemma-27b-it"
+concurrency = 8
+max_concurrency = 16
+account = "cloudflare"
+quota = 0
+metrics = true
+
+[[endpoint]]
+name = "colab-b"
+env_file = ".env"
+url_key = "MEDGEMMA_BASE_URL_2"      # add to .env when notebook 2 is up
+auth_key = "MEDGEMMA_API_KEY"        # both notebooks use the same key
+model = "medgemma-27b-it"
+concurrency = 8
+max_concurrency = 16
+account = "cloudflare"
+quota = 0
+metrics = true
+
+# ---- ngrok on the DGX Spark: disabled since the move to Cloudflare
+
+[[endpoint]]
+name = "spark-a"
+enabled = false
+env_file = ".env"
+url_key = "NGROK_URL"
+auth_key = "NGROK_API_KEY"           # bearer token, from .env
+model = "medgemma-27b-it"
+concurrency = 8
+max_concurrency = 128
+account = "ngrok-1"
+quota = 19000
+
+[[endpoint]]
+name = "spark-b"
+enabled = false
+env_file = ".env"
+url_key = "NGROK_URL_2"
+auth_key = "NGROK_API_KEY_2"
+model = "medgemma-27b-it"
+concurrency = 8
+max_concurrency = 128
+account = "ngrok-2"                  # assumed separate from ngrok-1
+quota = 19000

@@ -1,0 +1,49 @@
+Evaluate the following encounter record.
+
+<record>
+label: {label}
+race: {race}
+gender: {gender}
+age: {age}
+admission_type_id: {admission_type_id}
+admission_source_id: {admission_source_id}
+discharge_disposition_id: {discharge_disposition_id}
+time_in_hospital: {time_in_hospital}
+payer_code: {payer_code}
+medical_specialty: {medical_specialty}
+num_lab_procedures: {num_lab_procedures}
+num_procedures: {num_procedures}
+num_medications: {num_medications}
+number_diagnoses: {number_diagnoses}
+number_outpatient: {number_outpatient}
+number_emergency: {number_emergency}
+number_inpatient: {number_inpatient}
+diag_1: {diag_1}
+diag_2: {diag_2}
+diag_3: {diag_3}
+max_glu_serum: {max_glu_serum}
+A1Cresult: {A1Cresult}
+metformin: {metformin}
+repaglinide: {repaglinide}
+nateglinide: {nateglinide}
+chlorpropamide: {chlorpropamide}
+glimepiride: {glimepiride}
+acetohexamide: {acetohexamide}
+glipizide: {glipizide}
+glyburide: {glyburide}
+tolbutamide: {tolbutamide}
+pioglitazone: {pioglitazone}
+rosiglitazone: {rosiglitazone}
+acarbose: {acarbose}
+miglitol: {miglitol}
+troglitazone: {troglitazone}
+tolazamide: {tolazamide}
+insulin: {insulin}
+glyburide-metformin: {glyburide-metformin}
+glipizide-metformin: {glipizide-metformin}
+glimepiride-pioglitazone: {glimepiride-pioglitazone}
+metformin-rosiglitazone: {metformin-rosiglitazone}
+metformin-pioglitazone: {metformin-pioglitazone}
+change: {change}
+diabetesMed: {diabetesMed}
+</record>
