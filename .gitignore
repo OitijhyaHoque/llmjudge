@@ -230,3 +230,6 @@ results/
 runs/
 *.jsonl
 .env
+
+exp_results/
+exp_input/
