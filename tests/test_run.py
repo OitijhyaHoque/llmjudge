@@ -404,6 +404,46 @@ class ItemsTests(unittest.TestCase):
         with self.assertRaises(cj.ConfigError):
             cj.load_items("/nonexistent/items.jsonl", 42)
 
+    def test_a_csv_needs_no_hand_written_jsonl(self):
+        """The common case: a table and a prompt naming its columns, nothing else."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rows.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("age,gender\n[70-80),F\n[50-60),M\n")
+            items, _, _ = cj.load_items(path, 42, ("age", "gender"))
+        self.assertEqual({i.id for i in items}, {"0", "1"})
+        self.assertEqual([i.fields for i in sorted(items, key=lambda i: i.id)],
+                         [{"age": "[70-80)", "gender": "F"},
+                          {"age": "[50-60)", "gender": "M"}])
+        self.assertEqual((items[0].group, items[0].stratum, items[0].weight), ("", "", 1.0))
+
+    def test_a_csv_may_carry_id_group_stratum_and_weight(self):
+        """Those four columns are the item's keys, not fields the prompt can name."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rows.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("id,group,stratum,weight,age\nr1,kept,a,2.5,70\n")
+            items, _, _ = cj.load_items(path, 42, ("age",))
+            self.assertEqual((items[0].id, items[0].group, items[0].stratum,
+                              items[0].weight, items[0].fields),
+                             ("r1", "kept", "a", 2.5, {"age": "70"}))
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("id,weight,age\nr1,heavy,70\n")             # refused, with the line
+            with self.assertRaises(cj.ConfigError) as cm:
+                cj.load_items(path, 42)
+            self.assertIn(":2:", str(cm.exception))
+            self.assertIn('"weight" must be', str(cm.exception))
+
+    def test_a_csv_is_checked_against_the_prompt_columns_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rows.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("age\n70\n")
+            with self.assertRaises(cj.ConfigError) as cm:
+                cj.load_items(path, 42, ("age", "gender"))
+        self.assertIn("gender", str(cm.exception))
+
 
 class TunerTests(unittest.TestCase):
     def _round(self, t: cj.Tuner, seconds: float):

@@ -5,8 +5,11 @@ answers. It holds **no rules, no cards, no knowledge tables, and no opinion abou
 model should answer** — the prompt decides that.
 
 ```
-CSV + pool spec ──make-items──> items.jsonl ──judge──> results.jsonl + summary.json
+CSV  (or items.jsonl, drawn from a CSV by make-items)  ──judge──> results.jsonl + summary.json
 ```
+
+`--items` takes a CSV directly: one item per row, every column a field. `make-items` is
+the other path, for drawing a stratified, weighted pool out of a large table first.
 
 Both halves are here, and nothing outside this repository is needed to run either. A
 colleague with a different dataset — or no rules at all — uses it unchanged: `make-items`
@@ -26,7 +29,7 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 87 tests, ~33s, no server needed
+python3 -m unittest discover -s tests -t .            # 90 tests, ~33s, no server needed
 
 llmjudge make-items --spec configs/pool.diabetes130.toml --pool pilot \
     --root /path/to/your/runs --out items.jsonl       # draw the pool
@@ -301,6 +304,10 @@ where there is one. Errors are recorded, never
 dropped, so a re-run retries exactly them.
 
 ### Building the items file
+
+A CSV needs no items file: pass it to `--items` and every row is an item, every column a
+field, with `id`, `group`, `stratum` and `weight` columns read as those keys if present.
+Write JSONL for nested fields, or use `make-items` below for a sampled pool.
 
 `llmjudge make-items` draws the pool. It reads a CSV of rows and, optionally, a second CSV
 of per-row attributes — a rules `decisions.csv`, a labelling, a clustering — that steer

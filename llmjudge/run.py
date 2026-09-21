@@ -11,7 +11,14 @@
 One row per request, temperature 0. The row is rendered into the prompt's `user.md`. The
 model never sees the row's id, group or stratum.
 
-Items (`--items`, one JSON object per line)
+Items (`--items`)
+
+    A .csv is one item per row and needs nothing else: every column becomes a field, and
+    an `id`, `group`, `stratum` or `weight` column, if the file has one, is used as that
+    key instead of as a field. Without an `id` column the row number is the id.
+
+    A .jsonl is one object per line, for a pool that carries nested fields or sampling
+    weights `make-items` computed:
 
     {"id": "ctgan_split:41772", "fields": {"age": "[70-80)", "diag_1": "250.83"}}
 
@@ -665,6 +672,36 @@ class Item:
         return Item(**{k: getattr(self, k) for k in self.__slots__ if k != "key"}, key=key)
 
 
+def iter_objs(path: str):
+    """-> (line number, item object), from a JSONL file or from a CSV.
+
+    A CSV row is one item: every column is a field, except an `id`, `group`, `stratum` or
+    `weight` column, which is lifted out to become that key. With no `id` column the row
+    number is the id, which is all resume needs. Checking happens in load_items either
+    way, so a bad CSV is refused whole like a bad JSONL.
+    """
+    if path.lower().endswith(".csv"):
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for i, row in enumerate(csv.DictReader(f, restval="")):
+                obj = {k: row.pop(k) for k in ("id", "group", "stratum", "weight")
+                       if k in row}
+                if "weight" in obj:
+                    try:
+                        obj["weight"] = float(obj["weight"])
+                    except ValueError:
+                        pass                    # load_items names the line and refuses
+                yield i + 2, {**obj, "id": obj.get("id") or str(i), "fields": row}
+        return
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                yield lineno, json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ConfigError(f"{path}:{lineno}: not JSON ({e})") from e
+
+
 def load_items(path: str, seed: int, columns: tuple[str, ...] = ()) -> tuple[list[Item], str, str]:
     """-> (items in send order, sha of the items file, order.csv text).
 
@@ -677,37 +714,29 @@ def load_items(path: str, seed: int, columns: tuple[str, ...] = ()) -> tuple[lis
     items: list[Item] = []
     seen: set[str] = set()
     try:
-        with open(path, encoding="utf-8") as f:
-            for lineno, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError as e:
-                    raise ConfigError(f"{path}:{lineno}: not JSON ({e})") from e
-                if not isinstance(obj, dict):
-                    raise ConfigError(f"{path}:{lineno}: expected an object, got {type(obj).__name__}")
-                item_id = obj.get("id")
-                if not isinstance(item_id, str) or not item_id:
-                    raise ConfigError(f'{path}:{lineno}: "id" must be a non-empty string')
-                if item_id in seen:
-                    raise ConfigError(f"{path}:{lineno}: duplicate id {item_id!r}")
-                seen.add(item_id)
-                fields = obj.get("fields")
-                if not isinstance(fields, dict):
-                    raise ConfigError(f'{path}:{lineno}: "fields" must be an object')
-                absent = [c for c in columns if c not in fields]
-                if absent:
-                    raise ConfigError(f"{path}:{lineno}: item {item_id!r} lacks the fields "
-                                      f"the prompt names: {absent}")
-                weight = obj.get("weight", 1.0)
-                if not isinstance(weight, (int, float)) or isinstance(weight, bool):
-                    raise ConfigError(f'{path}:{lineno}: "weight" must be a number')
-                items.append(Item(id=item_id, fields={k: v for k, v in fields.items()},
-                                  group=str(obj.get("group", "")),
-                                  stratum=str(obj.get("stratum", "")),
-                                  weight=float(weight)))
+        for lineno, obj in iter_objs(path):
+            if not isinstance(obj, dict):
+                raise ConfigError(f"{path}:{lineno}: expected an object, got {type(obj).__name__}")
+            item_id = obj.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                raise ConfigError(f'{path}:{lineno}: "id" must be a non-empty string')
+            if item_id in seen:
+                raise ConfigError(f"{path}:{lineno}: duplicate id {item_id!r}")
+            seen.add(item_id)
+            fields = obj.get("fields")
+            if not isinstance(fields, dict):
+                raise ConfigError(f'{path}:{lineno}: "fields" must be an object')
+            absent = [c for c in columns if c not in fields]
+            if absent:
+                raise ConfigError(f"{path}:{lineno}: item {item_id!r} lacks the fields "
+                                  f"the prompt names: {absent}")
+            weight = obj.get("weight", 1.0)
+            if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                raise ConfigError(f'{path}:{lineno}: "weight" must be a number')
+            items.append(Item(id=item_id, fields={k: v for k, v in fields.items()},
+                              group=str(obj.get("group", "")),
+                              stratum=str(obj.get("stratum", "")),
+                              weight=float(weight)))
     except FileNotFoundError as e:
         raise ConfigError(f"missing items file {path}") from e
     if not items:
@@ -1735,8 +1764,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--prompt-name", default="custom",
                     help="what to call a --system/--user prompt in run.json and summary.json")
     ap.add_argument("--items", required=True,
-                    help="JSONL, one object per row: id, fields, and optionally group, "
-                         "stratum, weight")
+                    help="rows to judge. A .csv is one item per row, every column a "
+                         "field. A .jsonl is one object per row: id, fields, and "
+                         "optionally group, stratum, weight")
     ap.add_argument("--seed", type=int, default=42, help="send-order and decoding seed")
     ap.add_argument("--run-tag", required=True)
     ap.add_argument("--out", required=True, help="results directory")
