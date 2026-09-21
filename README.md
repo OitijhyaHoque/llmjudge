@@ -24,7 +24,7 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 24 tests, ~18s, no server needed
+python3 -m unittest discover -s tests -t .            # 38 tests, ~25s, no server needed
 llmjudge --items items.jsonl --out out/pilot \
     --prompt c3 --run-tag pilot-01 --dry-run
 ```
@@ -35,7 +35,8 @@ and nothing is checked out at all:
 ```bash
 pip install "git+https://$GH_TOKEN@github.com/<org>/llmjudge.git@v0.1.0"
 llmjudge --items /content/drive/MyDrive/judge/items.jsonl --out results/pilot \
-    --prompt c3 --run-tag pilot-01 --endpoints my-endpoints.toml
+    --prompt c3 --run-tag pilot-01 \
+    --base-url https://host/v1 --model medgemma-27b-it
 ```
 
 The prompts ship inside the package, so `--prompt c3` works with no checkout. Every other
@@ -44,6 +45,41 @@ run in. `python3 -m llmjudge` is the same entry point as the `llmjudge` command.
 
 `--dry-run` renders the first prompt, prints it, and sends nothing. Always the first step
 against a new prompt or a new endpoint.
+
+## Saying where the model is
+
+One server needs no files at all:
+
+```bash
+export LLMJUDGE_API_KEY=...                  # or --api-key, but that lands in your history
+llmjudge --base-url https://host/v1 --model gpt-4o-mini ...
+```
+
+`--base-url` also comes from `LLMJUDGE_BASE_URL`, so a Colab cell that already exported
+the URL of the server it just started needs neither flag written down.
+
+Several servers — two notebooks sharing a pool, or MedGemma against a frontier model in
+`--mode compare` — go in an endpoints file, one entry each: `cp
+configs/endpoints.example.toml configs/endpoints.toml`. An entry names the *environment
+variables* holding its URL and key, never the values. Those are read from the entry's
+`env_file` if there is one, and from the process environment otherwise.
+
+### When the API does not take the same fields
+
+Every request carries `model`, `messages`, `temperature`, `seed` and `max_tokens`.
+Not every API accepts all of them: Anthropic has no `seed`, the reasoning models reject
+`temperature`, and newer OpenAI models want `max_completion_tokens`. So:
+
+```bash
+llmjudge --drop seed --drop temperature ...                        # remove
+llmjudge --extra '{"max_completion_tokens": 4096}' --drop max_tokens ...   # rename
+```
+
+`--extra` is merged into the body and `--drop` removes fields from it, so renaming a
+field is a drop plus an add. A field set to `null` in `--extra` is removed too. Both are
+visible in `<out>/request_example.json` under `--dry-run`, before anything is sent. An
+endpoints file entry can carry its own `extra = { ... }` and `drop = [ ... ]`, and the
+command line's apply on top of every endpoint.
 
 ## Your own prompt
 
@@ -75,7 +111,9 @@ judge(items="/content/drive/MyDrive/judge/items.jsonl",
 ```
 
 `judge()` takes every command-line option with underscores (`max_tokens`, `retry_errors`,
-`dry_run`). `system=` and `user=` are the prompt text, or the path to a file holding it —
+`dry_run`, `base_url`, `model`), a dict option as JSON (`extra={"top_p": 0.9}`) and a list
+option as a repeated flag (`drop=["seed"]`). It works inside a Colab or Jupyter cell,
+which runs in an event loop of its own. `system=` and `user=` are the prompt text, or the path to a file holding it —
 a value that names an existing file is read, anything else is the prompt. The text is
 copied to `<out>/prompt/`, so a results directory always carries the prompt that produced
 it, and re-running the same cell resumes rather than starts again.
@@ -158,9 +196,13 @@ Everything below is already implemented and covered by `tests/test_run.py`.
 A restart skips every row already recorded. `--retry-errors` re-sends only the rows whose
 latest record is an error.
 
+**A pool that grew.** The resume key is the row's `id` with the model, prompt and schema —
+not the items file. Append 2,000 rows to the file, re-run into the same directory, and
+only the new ids are sent. `run.json` restates which pool each session ran.
+
 **Refusal on a changed run.** `<out>/run.json` pins the prompt, the schema, the decoding
-settings, the send-order seed and the items file's sha. A restart into that directory with
-any of them changed is refused rather than quietly mixing two pools in one file.
+settings, the send-order seed and the mode. A restart into that directory with any of them
+changed is refused rather than quietly mixing two kinds of answer in one file.
 
 **Endpoints that come and go.** Connection errors, `ERR_NGROK_*`, 502/503/504 and
 Cloudflare 520–527 pause an endpoint; `/v1/models` and a canary are re-probed with
@@ -198,6 +240,7 @@ Never in the source, never in a notebook body.
 
 | where it runs | how it gets the key |
 |---|---|
+| one server, anywhere | `LLMJUDGE_API_KEY` in the environment, read when `--api-key` is not given |
 | your machine | `.env`, gitignored; the endpoints file names the key, not its value |
 | Colab | **Colab Secrets** (key icon in the sidebar), read with `userdata.get` |
 | the served endpoint's own key | generated fresh per session by `notebooks/serve_vllm.py` |

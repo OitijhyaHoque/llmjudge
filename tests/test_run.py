@@ -10,6 +10,7 @@ mock's verdicts are a fixed rule; nothing here says anything about a real model.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import contextlib
 import io
@@ -55,6 +56,8 @@ class MockState:
         self.slow_seconds = 0.0
         self.fail_503 = 0
         self.ignore_schema = False
+        self.last_body = None        # the request as it arrived, for the --drop / --extra tests
+        self.last_auth = None
         self.chat_calls = 0
         self.concurrent = 0
         self.max_concurrent = 0
@@ -89,6 +92,8 @@ def make_handler(state: MockState):
                 self.close_connection = True
                 return
             with state.lock:
+                state.last_body = req
+                state.last_auth = self.headers.get("Authorization")
                 state.chat_calls += 1
                 state.concurrent += 1
                 state.max_concurrent = max(state.max_concurrent, state.concurrent)
@@ -384,15 +389,22 @@ class RunBase(unittest.TestCase):
             self.server.close()
         self.tmp.cleanup()
 
-    def judge(self, *extra: str, endpoints: str | None = None, prompt: str = "c2") -> int:
-        argv = ["--prompt", prompt, "--items", self.items,
-                "--run-tag", "t", "--out", self.out,
-                "--endpoints", endpoints or write_endpoints(self.root, self.server.port),
+    def cli(self, *extra: str) -> int:
+        """The command line, without saying where the endpoint is."""
+        argv = ["--items", self.items, "--run-tag", "t", "--out", self.out,
                 "--timeout", "10", "--probe-min", "0.1", "--probe-max", "0.4",
                 "--give-up-after", "20", "--progress-every", "0.5", "--backoff-max", "0.2",
                 *extra]
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return cj.main(argv)
+
+    def judge(self, *extra: str, endpoints: str | None = None, prompt: str = "c2") -> int:
+        return self.cli("--prompt", prompt, "--endpoints",
+                        endpoints or write_endpoints(self.root, self.server.port), *extra)
+
+    def notebook_options(self) -> dict:
+        return {"timeout": 10, "probe_min": 0.1, "probe_max": 0.4, "give_up_after": 20,
+                "progress_every": 0.5, "backoff_max": 0.2}
 
     @property
     def results(self) -> list[dict]:
@@ -578,6 +590,99 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(cj.classify(404, "ERR_NGROK_3200"), "down")
         self.assertEqual(cj.classify(404, None), "bad_request")
         self.assertEqual(cj.classify(401, None), "auth")
+
+
+class FlexibilityTests(RunBase):
+    """What a colleague must write before a run, and what a run may change afterwards."""
+
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.port}/v1"
+
+    def test_one_endpoint_needs_no_endpoints_file_and_no_env_file(self):
+        """--base-url and --model are a whole endpoint. The key comes from the
+        environment, which is where a Colab serving cell already leaves it."""
+        os.environ["LLMJUDGE_API_KEY"] = "k-from-the-environment"
+        self.addCleanup(os.environ.pop, "LLMJUDGE_API_KEY", None)
+        self.assertEqual(self.cli("--prompt", "c2", "--base-url", self.url(),
+                                  "--model", MODEL, "--limit", "5"), cj.EXIT_OK)
+        self.assertEqual(len(self.results), 5)
+        self.assertEqual(self.state.last_auth, "Bearer k-from-the-environment")
+
+    def test_the_base_url_is_read_from_the_environment_too(self):
+        """The serving notebook exports MEDGEMMA_BASE_URL; nothing should have to be
+        copied from its output into a file."""
+        os.environ["LLMJUDGE_BASE_URL"] = self.url()
+        self.addCleanup(os.environ.pop, "LLMJUDGE_BASE_URL", None)
+        self.assertEqual(self.cli("--prompt", "c2", "--model", MODEL, "--limit", "3"),
+                         cj.EXIT_OK)
+        self.assertEqual(len(self.results), 3)
+
+    def test_a_missing_endpoints_file_says_what_to_do_instead(self):
+        rc = self.cli("--prompt", "c2", "--endpoints", os.path.join(self.root, "nope.toml"),
+                      "--dry-run")
+        self.assertEqual(rc, cj.EXIT_OK)                      # a dry run needs no endpoint
+        with self.assertRaises(cj.ConfigError) as cm:
+            cj.load_endpoints(os.path.join(self.root, "nope.toml"), [])
+        self.assertIn("--base-url", str(cm.exception))
+
+    def test_judge_runs_inside_a_notebook_event_loop(self):
+        """Colab and Jupyter run a cell inside their own event loop, where asyncio.run
+        raises. The notebook entry point has to work there or it is not one."""
+        async def cell() -> int:
+            return cj.judge(items=self.items, out=self.out, run_tag="t",
+                            base_url=self.url(), model=MODEL, limit=4,
+                            **self.notebook_options())
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = asyncio.run(cell())
+        self.assertEqual(rc, cj.EXIT_OK)
+        self.assertEqual(len(self.results), 4)
+
+    def test_a_pool_that_grew_is_resumed_not_refused(self):
+        """Someone generates 200 more rows and appends them. The rows already judged
+        stay judged; only the new ids are sent."""
+        self.assertEqual(self.judge(), cj.EXIT_OK)
+        calls = self.state.chat_calls
+        with open(self.items, "a", encoding="utf-8") as f:
+            for i in range(2):
+                f.write(json.dumps({"id": f"late:{i}", "group": "kept", "stratum": "new",
+                                    "fields": base_row(i)}) + "\n")
+        self.assertEqual(self.judge(), cj.EXIT_OK)
+        self.assertEqual(self.state.chat_calls - calls, 1 + 2)        # canary + the new rows
+        self.assertEqual(len(self.results), POOL_ROWS + 2)
+        with open(os.path.join(self.out, "run.json")) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["items_rows"], POOL_ROWS + 2)           # restated, not pinned
+        self.assertEqual([s["items_rows"] for s in meta["sessions"]],
+                         [POOL_ROWS, POOL_ROWS + 2])                  # both pools on record
+
+    def test_request_fields_can_be_dropped_and_renamed(self):
+        """Anthropic has no seed, the reasoning models reject temperature, and newer
+        OpenAI models want max_completion_tokens. A dry run shows the real body."""
+        self.assertEqual(
+            self.judge("--dry-run", "--drop", "seed", "--drop", "max_tokens",
+                       "--extra", '{"max_completion_tokens": 4096, "temperature": null}'),
+            cj.EXIT_OK)
+        with open(os.path.join(self.out, "request_example.json")) as f:
+            body = json.load(f)
+        self.assertNotIn("seed", body)
+        self.assertNotIn("max_tokens", body)
+        self.assertNotIn("temperature", body)                         # null removes it
+        self.assertEqual(body["max_completion_tokens"], 4096)
+
+    def test_a_dropped_field_is_really_absent_from_the_request(self):
+        self.assertEqual(self.judge("--limit", "2", "--drop", "seed"), cj.EXIT_OK)
+        self.assertNotIn("seed", self.state.last_body)
+        self.assertIn("max_tokens", self.state.last_body)
+
+    def test_an_endpoints_file_and_base_url_together_are_refused(self):
+        """Not silently ignoring one of them."""
+        self.assertEqual(self.judge("--base-url", self.url(), "--model", MODEL),
+                         cj.EXIT_CONFIG)
+
+    def test_a_broken_extra_is_refused_before_anything_is_sent(self):
+        self.assertEqual(self.judge("--dry-run", "--extra", "not json"), cj.EXIT_CONFIG)
+        self.assertEqual(self.judge("--dry-run", "--extra", "[1]"), cj.EXIT_CONFIG)
+        self.assertEqual(self.state.chat_calls, 0)
 
 
 class HotSwapTests(RunBase):

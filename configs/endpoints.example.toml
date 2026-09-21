@@ -1,8 +1,13 @@
 # Endpoints for llmjudge. Copy to configs/endpoints.toml and edit; the copy is yours,
 # this example is the one under version control.
 #
+# You do not need this file for a single server: `--base-url https://host/v1 --model NAME`
+# is a whole endpoint, with the key in --api-key or LLMJUDGE_API_KEY. This file is for a
+# run against several at once.
+#
 # URLs and keys stay in .env; this file only names the keys, so it is safe to commit and
-# safe to paste into a ticket. Paths are relative to the repository root.
+# safe to paste into a ticket. A key that is not in the env file -- or no env file at all --
+# is looked up in the process environment instead. Paths are relative to the repository root.
 #
 # concurrency       starting in-flight window; the script grows it while throughput rises
 # max_concurrency   ceiling; keep it at or below vLLM's --max-num-seqs. Requests above it
@@ -15,6 +20,10 @@
 #                   Only where requests are not capped.
 # extra             merged into every request body, e.g. for a thinking-capable model:
 #                   extra = { chat_template_kwargs = { enable_thinking = false } }
+# drop              request fields this API rejects, removed from the body. Anthropic has
+#                   no seed, the reasoning models reject temperature, and newer OpenAI
+#                   models want max_completion_tokens -- renaming is drop plus extra:
+#                   drop = ["max_tokens"], extra = { max_completion_tokens = 4096 }
 # enabled = false   keep an entry without using it
 #
 # Every endpoint a run may use must be listed here when the run starts. Its URL may come

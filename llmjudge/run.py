@@ -78,13 +78,15 @@ refuses an endpoint whose first 20 replies all fail parsing does the rest.
 Resume
     `<out>/results.jsonl` is append-only, one line per final answer, flushed per line and
     fsync'd every 50. A restart skips every row already recorded; `--retry-errors` re-sends
-    rows whose latest record is an error or a parse error. The resume key is (items file sha,
-    item id, model, prompt sha, schema sha or "guided=off"), plus the endpoint in compare
-    mode. Runs made before the items interface used (table sha, arm, row index) instead and
+    rows whose latest record is an error or a parse error. The resume key is (item id,
+    model, prompt sha, schema sha or "guided=off"), plus the endpoint in compare mode.
+    The items file's own sha is not part of it, so a pool that grew is judged where it
+    grew: add rows to the file, re-run into the same directory, and only the new ids are
+    sent. Runs made before the items interface keyed on (table sha, arm, row index) and
     do not resume here; their results.jsonl stays readable.
-    `<out>/run.json` pins prompt, schema, decoding, pool and inputs; a restart with any of
-    them changed is refused. Ctrl-C once: stop sending, let in-flight requests finish,
-    write the summary. Twice: exit now (every recorded line is already on disk).
+    `<out>/run.json` pins prompt, schema, decoding, order seed and mode; a restart with
+    any of them changed is refused. Ctrl-C once: stop sending, let in-flight requests
+    finish, write the summary. Twice: exit now (every recorded line is already on disk).
 
 Items (`--items`, one JSON object per line)
 
@@ -110,6 +112,18 @@ Modes
     shard      one shared queue, every endpoint pulls from it; all must serve one model.
     compare    every row to every endpoint (e.g. MedGemma vs a general model). With two
                replicas of one model, `--mode compare --limit 200` is the agreement check.
+
+Endpoints
+    One server needs no files: `--base-url https://host/v1 --model NAME`, with the key in
+    `--api-key` or `LLMJUDGE_API_KEY`. Several, or one with a quota and a window of its
+    own, go in `--endpoints endpoints.toml`, where each entry names the environment
+    variables holding its URL and key; those are read from the endpoint's env file if
+    there is one and from the process environment otherwise.
+
+    Request fields differ between APIs. `--drop seed --drop temperature` removes what an
+    API rejects and `--extra '{"max_completion_tokens": 4096}'` adds what it wants, so
+    renaming a field is a drop plus an add. Both show up in `request_example.json` under
+    `--dry-run`, before anything is sent.
 
     python3 -m llmjudge --items items.jsonl --out out/c3-pilot --prompt c3 \\
         --run-tag c3-pilot-01 --dry-run
@@ -141,6 +155,7 @@ import random
 import re
 import signal
 import sys
+import threading
 import time
 import tomllib
 
@@ -159,6 +174,7 @@ WAITING = re.compile(r"^vllm:num_requests_waiting(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
 THOUGHT = re.compile(r"<unused94>.*?(?:<unused95>|$)", re.S)   # MedGemma's thinking span
 
 ORDER_FIELDS = ["order", "id", "group", "stratum", "weight"]
+ENDPOINTS_DEFAULT = "configs/endpoints.toml"
 
 EXIT_OK, EXIT_CONFIG, EXIT_INCOMPLETE = 0, 2, 3
 
@@ -518,7 +534,17 @@ def parse_tolerant(content: str | None, contract: dict) -> dict:
 
 def build_payload(model: str, prompt: dict, user_text: str, decoding: dict,
                   extra: dict | None = None, schema: dict | None = None,
-                  name: str = "c2_verdict", guided: bool = True) -> dict:
+                  name: str = "c2_verdict", guided: bool = True,
+                  drop: list[str] | None = None) -> dict:
+    """The request body. `extra` adds or overrides fields, `drop` removes them, and a
+    field set to null is removed too.
+
+    Not every OpenAI-compatible API takes the same fields. Anthropic has no `seed`, the
+    reasoning models reject `temperature`, and newer OpenAI models want
+    `max_completion_tokens` instead of `max_tokens`. Renaming is dropping plus adding:
+
+        --drop max_tokens --extra '{"max_completion_tokens": 4096}'
+    """
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": prompt["system"]},
@@ -530,6 +556,8 @@ def build_payload(model: str, prompt: dict, user_text: str, decoding: dict,
         payload["response_format"] = {"type": "json_schema", "json_schema": {
             "name": name, "schema": schema or prompt["schema"], "strict": True}}
     payload.update(extra or {})
+    for k in list(drop or []) + [k for k, v in payload.items() if v is None]:
+        payload.pop(k, None)
     return payload
 
 
@@ -609,10 +637,17 @@ def load_items(path: str, seed: int, columns: tuple[str, ...] = ()) -> tuple[lis
     return items, file_sha(path), buf.getvalue()
 
 
-def row_key(items_sha: str, item_id: str, model: str, prompt: dict,
+def row_key(item_id: str, model: str, prompt: dict,
             endpoint: str = "", guided: bool = True) -> str:
-    """What resume is keyed on. Changing any part of it means a row is sent again."""
-    return sha("|".join([items_sha, item_id, model, prompt["prompt_sha"],
+    """What resume is keyed on. Changing any part of it means a row is sent again.
+
+    The items file's sha is deliberately not in here. A pool grows: someone generates
+    another 200 rows and adds them to the file. Keying on the file meant every row
+    already judged was judged again, which for a 50,000-row pool is a day of GPU time to
+    re-learn what is already on disk. The id is unique within the file and the prompt,
+    model and schema are pinned separately, so the file's identity adds nothing.
+    """
+    return sha("|".join([item_id, model, prompt["prompt_sha"],
                          prompt["schema_sha"] if guided else "guided=off", endpoint]))[:32]
 
 
@@ -640,9 +675,15 @@ def read_results(path: str) -> tuple[dict[str, dict], int, int]:
     return latest, n, bad
 
 
+# What may not change between sessions writing into one results directory. The items
+# file is not on the list: a pool that grew is the ordinary case, and every row carries
+# its own id. What must not change is how a row was judged.
 PINNED = ("prompt", "prompt_sha", "schema_sha", "key_order", "guided", "decoding",
-          "order_seed", "order_sha", "items_sha", "items_rows", "mode")
+          "order_seed", "mode")
 PINNED_DEFAULTS: dict = {}
+# Re-stated every session instead, so run.json describes the pool that is there now and
+# the sessions list keeps the history.
+RESTATED = ("items", "items_sha", "items_rows", "order_sha")
 
 
 def check_run_json(out: str, meta: dict, session: dict) -> None:
@@ -655,6 +696,7 @@ def check_run_json(out: str, meta: dict, session: dict) -> None:
             raise ConfigError(
                 f"{rel(out)} was started with different {diff}. Use a new --run-tag; "
                 f"never pool results across configurations.")
+        old.update({k: meta.get(k) for k in RESTATED})
         old.setdefault("sessions", []).append(session)
         write_json(path, old)
     else:
@@ -876,7 +918,9 @@ class Endpoint:
         self.model = cfg["model"]
         self.account = cfg.get("account") or self.name
         self.quota_limit = int(cfg.get("quota", 0))
-        self.extra = cfg.get("extra") or {}
+        # The run's own --extra / --drop apply to every endpoint, on top of its entry's.
+        self.extra = {**(cfg.get("extra") or {}), **(run.args.extra or {})}
+        self.drop = list(cfg.get("drop") or []) + list(run.args.drop or [])
         self.metrics = bool(cfg.get("metrics", False))
         hi = int(cfg.get("max_concurrency", 128))
         self.tuner = Tuner(int(cfg.get("concurrency", 8)), int(cfg.get("min_concurrency", 1)), hi)
@@ -904,22 +948,29 @@ class Endpoint:
 
     # -- configuration ---------------------------------------------------------------
     def load_env(self) -> None:
+        """Where the URL and the key come from, in order: the endpoint entry itself
+        (`--base-url`, `--api-key`), then the env file, then the process environment.
+
+        The env file does not have to exist. A Colab cell that ran `serve_vllm.py` already
+        has the URL and the key in `os.environ`, and a vendor API usually has its key
+        there too, so demanding a `.env` on disk only made people write one."""
         env_file = resolve(self.cfg.get("env_file", ".env"))
-        try:
-            env = read_env(env_file)
-        except FileNotFoundError as e:
-            raise ConfigError(f"endpoint {self.name}: no env file {env_file}") from e
-        url = env.get(self.cfg["url_key"])
+        env = read_env(env_file) if os.path.isfile(env_file) else {}
+        where = f"the endpoints file, {rel(env_file)} or the environment"
+        url = self.cfg.get("url") or env.get(self.cfg["url_key"]) or \
+            os.environ.get(self.cfg["url_key"])
         if not url:
-            raise ConfigError(f"endpoint {self.name}: {self.cfg['url_key']} not in {env_file}")
+            raise ConfigError(f"endpoint {self.name}: no URL — {self.cfg['url_key']} is "
+                              f"in none of {where}")
         url = (url if "://" in url else "https://" + url).rstrip("/")
         root = url[:-3] if url.endswith("/v1") else url
         headers = dict(HEADERS)
         if self.cfg.get("auth_key"):
-            cred = env.get(self.cfg["auth_key"])
+            cred = (self.cfg.get("api_key") or env.get(self.cfg["auth_key"])
+                    or os.environ.get(self.cfg["auth_key"]))
             if not cred:
-                raise ConfigError(f"endpoint {self.name}: {self.cfg['auth_key']} not in "
-                                  f"{env_file}")
+                raise ConfigError(f"endpoint {self.name}: no key — {self.cfg['auth_key']} "
+                                  f"is in none of {where}")
             if self.cfg.get("auth_scheme", "bearer") == "basic":
                 headers["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
             else:
@@ -998,7 +1049,7 @@ class Endpoint:
         payload = build_payload(
             self.model, run.prompt, run.render(run.canary_item), run.decoding, self.extra,
             schema=canary_schema(contract) if run.guided else None,
-            name="canary", guided=run.guided)
+            name="canary", guided=run.guided, drop=self.drop)
         kind, r = await self.call("POST", "/chat/completions", json.dumps(payload).encode(),
                                   run.args.timeout)
         if kind == "auth":
@@ -1214,7 +1265,7 @@ class Run:
         try:
             body = json.dumps(build_payload(ep.model, self.prompt, self.render(it),
                                             self.decoding, ep.extra,
-                                            guided=self.guided)).encode()
+                                            guided=self.guided, drop=ep.drop)).encode()
             kind, r = await ep.call("POST", "/chat/completions", body, self.args.timeout)
         except Exception as e:
             # Rendering and serialising happen here, so a bug in either used to kill the
@@ -1390,7 +1441,8 @@ class Run:
                 "quota_used_this_month": self.quota.used(ep.account),
                 "requests_this_session": ep.stats["requests"], "rows_this_session": ep.stats["rows"],
                 "window": ep.tuner.limit, "window_bounds": [ep.tuner.lo, ep.tuner.hi],
-                "errors": dict(ep.errors), "extra": ep.extra or None, "canary": ep.canary,
+                "errors": dict(ep.errors), "extra": ep.extra or None,
+                "drop": ep.drop or None, "canary": ep.canary,
                 "events": list(ep.events)} for ep in self.endpoints]})
 
     def write_summary(self) -> dict:
@@ -1470,12 +1522,61 @@ class Run:
 # entry point
 
 
+def run_async(coro):
+    """asyncio.run, except in a notebook cell, where there is already a loop running.
+
+    Jupyter and Colab execute a cell inside their own event loop, so `asyncio.run` there
+    raises "cannot be called from a running event loop" and the whole notebook entry
+    point was unusable. A worker thread gets its own loop and the cell blocks on the
+    join, which is what a cell should do anyway. The signal handlers are already skipped
+    off the main thread, so Ctrl-C there is the kernel's interrupt, not a drain.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    box: dict = {}
+
+    def work():
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as e:                      # noqa: BLE001 - re-raised below
+            box["error"] = e
+
+    t = threading.Thread(target=work, name="llmjudge")
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def cli_endpoint(args) -> list[dict]:
+    """One endpoint straight off the command line: no endpoints file, no .env.
+
+    This is how a colleague with a vendor API key, or a Colab cell that just started its
+    own server, runs the judge -- two flags rather than two files to write first."""
+    if not args.model:
+        raise ConfigError("--base-url needs --model: the name the server answers "
+                          "/v1/models with")
+    cfg = {"name": "cli", "url_key": "LLMJUDGE_BASE_URL", "model": args.model,
+           "env_file": os.devnull}
+    if args.base_url:
+        cfg["url"] = args.base_url
+    key = args.api_key or os.environ.get("LLMJUDGE_API_KEY")
+    if key:                                # no key at all is fine: a local server needs none
+        cfg["auth_key"], cfg["api_key"] = "LLMJUDGE_API_KEY", key
+    return [cfg]
+
+
 def load_endpoints(path: str, only: list[str]) -> tuple[list[dict], str]:
     try:
         with open(path, "rb") as f:
             cfg = tomllib.load(f)
     except FileNotFoundError as e:
-        raise ConfigError(f"no endpoints file {path}") from e
+        raise ConfigError(f"no endpoints file {rel(path)}. For a single server, "
+                          f"--base-url https://host/v1 --model NAME needs no file at "
+                          f"all; for several, copy configs/endpoints.example.toml") from e
     eps = [e for e in cfg.get("endpoint", []) if e.get("enabled", True)]
     if only:
         unknown = sorted(set(only) - {e["name"] for e in cfg.get("endpoint", [])})
@@ -1508,9 +1609,23 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=42, help="send-order and decoding seed")
     ap.add_argument("--run-tag", required=True)
     ap.add_argument("--out", required=True, help="results directory")
-    ap.add_argument("--endpoints", default="configs/endpoints.toml")
+    ap.add_argument("--endpoints", default=ENDPOINTS_DEFAULT,
+                    help="TOML file of endpoints, for a run against more than one server. "
+                         "--base-url instead for a single one, and then no file is needed")
     ap.add_argument("--endpoint", action="append", default=[],
                     help="use only this endpoint (repeatable)")
+    ap.add_argument("--base-url", help="one endpoint, with no endpoints file and no .env: "
+                                       "the OpenAI-compatible base URL, e.g. "
+                                       "https://host/v1. Also read from LLMJUDGE_BASE_URL")
+    ap.add_argument("--model", help="the model to ask for; required with --base-url")
+    ap.add_argument("--api-key", help="bearer token for --base-url. Prefer the environment: "
+                                      "LLMJUDGE_API_KEY is read when this is not given, and "
+                                      "a key on the command line lands in your shell history")
+    ap.add_argument("--extra", help="JSON object merged into every request body, e.g. "
+                                    "'{\"max_completion_tokens\": 4096}'. null removes a field")
+    ap.add_argument("--drop", action="append", default=[], metavar="FIELD",
+                    help="remove a field from every request body (repeatable). --drop seed "
+                         "--drop temperature for an API that rejects them")
     ap.add_argument("--mode", choices=["shard", "compare"], default="shard")
     ap.add_argument("--limit", type=int, default=0, help="only the first N rows of the send order")
     ap.add_argument("--retry-errors", action="store_true",
@@ -1552,7 +1667,13 @@ def judge(items: str, out: str, run_tag: str, system: str | None = None,
         from llmjudge import judge
         judge(items="/content/drive/MyDrive/judge/items.jsonl",
               out="/content/drive/MyDrive/judge/results/pilot",
-              run_tag="pilot-01", system=SYSTEM, user=USER, guided="off", limit=100)
+              run_tag="pilot-01", system=SYSTEM, user=USER, guided="off", limit=100,
+              base_url="http://127.0.0.1:8000/v1", model="medgemma-27b-it")
+
+    `base_url` and `model` are one endpoint with no files to write first; the key comes
+    from `api_key=` or the environment. A dict option is sent as JSON and a list option
+    repeats its flag, so `extra={"max_completion_tokens": 4096}` and `drop=["seed"]`
+    both work from a cell.
 
     `system` and `user` are the prompt itself -- the text of a cell, or a path to a file
     on Drive; a value that names an existing file is read, anything else is the prompt.
@@ -1579,7 +1700,15 @@ def judge(items: str, out: str, run_tag: str, system: str | None = None,
         if v is None or v is False:
             continue
         flag = "--" + k.replace("_", "-")
-        argv += [flag] if v is True else [flag, str(v)]
+        if v is True:
+            argv += [flag]
+        elif isinstance(v, dict):
+            argv += [flag, json.dumps(v)]            # extra={"max_completion_tokens": 4096}
+        elif isinstance(v, (list, tuple)):
+            for one in v:                            # drop=["seed", "temperature"]
+                argv += [flag, str(one)]
+        else:
+            argv += [flag, str(v)]
     return main(argv)
 
 
@@ -1601,6 +1730,13 @@ def run_main(args: argparse.Namespace) -> int:
     guided = args.guided == "on"
     if args.max_tokens is None:
         args.max_tokens = 96 if guided else 1024
+    if isinstance(args.extra, str):
+        try:
+            args.extra = json.loads(args.extra)
+        except ValueError as e:
+            raise ConfigError(f"--extra is not JSON ({e}): {args.extra}") from e
+    if args.extra is not None and not isinstance(args.extra, dict):
+        raise ConfigError("--extra must be a JSON object of request fields")
     items_path = resolve(args.items)
     out = resolve(args.out)
     decoding = {"temperature": args.temperature, "seed": args.seed,
@@ -1622,7 +1758,9 @@ def run_main(args: argparse.Namespace) -> int:
             "mode": args.mode}
     session = {"started": now_iso(), "argv": sys.argv[1:] if __name__ == "__main__" else None,
                "script_sha": file_sha(os.path.abspath(__file__)), "dry_run": args.dry_run,
-               "pid": os.getpid()}
+               "pid": os.getpid(),
+               # The pool may differ from session to session; which one this session ran.
+               "items": rel(items_path), "items_sha": items_sha, "items_rows": len(items)}
     os.makedirs(out, exist_ok=True)
     check_run_json(out, meta, session)
     order_path = os.path.join(out, "order.csv")
@@ -1643,14 +1781,24 @@ def run_main(args: argparse.Namespace) -> int:
     with open(os.path.join(out, "prompt_example.txt"), "w", encoding="utf-8") as f:
         f.write(f"=== SYSTEM ===\n{prompt['system']}\n\n=== USER ===\n{user_text}\n")
     write_json(os.path.join(out, "request_example.json"),
-               build_payload("<model from the endpoints file>", prompt, user_text, decoding,
-                             guided=guided))
+               build_payload(args.model or "<model from the endpoints file>", prompt,
+                             user_text, decoding, args.extra, guided=guided,
+                             drop=args.drop))
     if args.dry_run:
         log(f"dry run: no calls. Wrote order.csv, run.json, prompt_example.txt, "
             f"request_example.json in {rel(out)}")
         return EXIT_OK
 
-    ep_cfgs, quota_file = load_endpoints(resolve(args.endpoints), args.endpoint)
+    if (args.base_url or args.model) and (args.endpoint or
+                                          args.endpoints != ENDPOINTS_DEFAULT):
+        raise ConfigError("--base-url/--model describe one endpoint instead of an "
+                          "endpoints file; giving both would silently ignore the file")
+    if args.base_url or args.model:
+        # One endpoint and one run, so there is nothing to share: the request count goes
+        # beside the results rather than into a file somewhere up the tree.
+        ep_cfgs, quota_file = cli_endpoint(args), os.path.join(out, "quota.json")
+    else:
+        ep_cfgs, quota_file = load_endpoints(resolve(args.endpoints), args.endpoint)
     if args.mode == "shard" and len({e["model"] for e in ep_cfgs}) > 1:
         raise ConfigError(f"shard mode needs one model on every endpoint, got "
                           f"{sorted({e['model'] for e in ep_cfgs})}; use --mode compare")
@@ -1663,7 +1811,7 @@ def run_main(args: argparse.Namespace) -> int:
     selected = items[:args.limit] if args.limit else items
 
     def key_for(it: Item, model: str, endpoint: str = "") -> str:
-        return row_key(items_sha, it.id, model, prompt, endpoint, guided)
+        return row_key(it.id, model, prompt, endpoint, guided)
 
     if args.mode == "shard":
         model = ep_cfgs[0]["model"]
@@ -1685,7 +1833,7 @@ def run_main(args: argparse.Namespace) -> int:
     with open(pid_path, "w") as f:
         f.write(f"{os.getpid()}\n")
     try:
-        return asyncio.run(run.main())
+        return run_async(run.main())
     finally:
         with open(pid_path) as f:
             if f.read().strip() == str(os.getpid()):
