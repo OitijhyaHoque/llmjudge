@@ -29,7 +29,7 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 90 tests, ~33s, no server needed
+python3 -m unittest discover -s tests -t .            # 93 tests, ~34s, no server needed
 
 llmjudge make-items --spec configs/pool.diabetes130.toml --pool pilot \
     --root /path/to/your/runs --out items.jsonl       # draw the pool
@@ -119,6 +119,34 @@ Several servers — two notebooks sharing a pool, or MedGemma against a frontier
 configs/endpoints.example.toml configs/endpoints.toml`. An entry names the *environment
 variables* holding its URL and key, never the values. Those are read from the entry's
 `env_file` if there is one, and from the process environment otherwise.
+
+### Splitting one pool across runtimes
+
+```bash
+llmjudge --part 1/2 --out out/pilot-a ...      # one runtime
+llmjudge --part 2/2 --out out/pilot-b ...      # the other, at the same time
+```
+
+`--mode shard` splits work over endpoints one process can see. `--part k/n` splits it
+over processes that cannot share a queue — two Colab notebooks, two machines, two people.
+The send order is shuffled before it is cut, so `--part 1/2` and `--part 2/2` are
+disjoint random halves; `--part 3/4` is the third quarter. Splitting the items file by
+hand instead does not work: `make-items` writes it sorted by id, so the first half of the
+file is the first table rather than half the pool.
+
+Give each part its own `--out`. One directory is one process — two of them appending to
+one `results.jsonl` tear each other's lines. Afterwards the parts concatenate, because a
+row's resume key does not depend on which part sent it:
+
+```bash
+cat out/pilot-?/results.jsonl > out/pilot/results.jsonl
+cp out/pilot-a/run.json out/pilot/
+python3 -c "import json,sys;from llmjudge.run import summarise; \
+    print(json.dumps(summarise('out/pilot/results.jsonl', json.load(open('out/pilot/run.json'))), indent=2))"
+```
+
+Each part's own `summary.json` reports its `missing` and carries `"part"`, so a part that
+stopped short is visible without merging anything.
 
 ### Slow replies, and a ceiling on the bill
 

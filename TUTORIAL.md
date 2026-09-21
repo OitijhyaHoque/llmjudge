@@ -458,7 +458,61 @@ Exit code `4` means judging finished but the final Drive mirror is incomplete. T
 prints the local runtime path containing the results; copy them before the runtime is
 recycled.
 
-## 6. Read the output
+## 6. Split a long run across two runtimes
+
+One pool, two processes that cannot see each other -- two Colab notebooks, two machines,
+a colleague's GPU. Each takes a part of the send order and writes its own directory:
+
+```bash
+llmjudge --items rows.csv --out out/demo-a --prompt prompts/demo \
+  --run-tag demo-01 --base-url "$A" --model local-judge --part 1/2      # one runtime
+
+llmjudge --items rows.csv --out out/demo-b --prompt prompts/demo \
+  --run-tag demo-01 --base-url "$B" --model local-judge --part 2/2      # the other
+```
+
+`--part k/n` cuts the send order, which is shuffled first, so `1/2` and `2/2` are
+disjoint random halves and together are the whole pool. `3/4` is the third quarter. Add
+`--dry-run` and the log says how many rows that part will send, before anything is spent.
+
+Do not split the items file by hand instead: `make-items` writes it sorted by id, so its
+first half is the first table rather than half the pool.
+
+Two rules:
+
+- **One `--out` per process.** Two of them appending to one `results.jsonl` tear each
+  other's lines, and the rows in a torn line are simply re-sent.
+- **Read each part's own `summary.json`** for its `missing`; each one carries the `part`
+  it covered.
+
+To report the pool as one run, concatenate the parts. A row's resume key does not depend
+on which part sent it, so the concatenation is an ordinary results file:
+
+```bash
+mkdir -p out/demo-all
+cat out/demo-?/results.jsonl > out/demo-all/results.jsonl
+cp out/demo-a/run.json out/demo-all/
+
+python3 -c '
+import json
+from llmjudge.run import summarise
+
+meta = json.load(open("out/demo-all/run.json"))
+summary = summarise("out/demo-all/results.jsonl", meta)
+json.dump(summary, open("out/demo-all/summary.json", "w"), indent=2)
+print(summary["rows"], "rows,", summary["parse_errors"], "parse errors,",
+      summary["errors"] or "no errors")
+'
+```
+
+The merged summary has no `missing` count, because nothing there knows what was planned.
+That number stays in each part's own `summary.json`.
+
+`--mode shard` is a different thing: it splits one queue over several endpoints *one*
+process talks to. Use it when the process can reach both servers, and `--part` when it
+cannot.
+
+## 7. Read the output
 
 Every real run writes an output directory such as `out/demo-local/`:
 
@@ -473,7 +527,7 @@ Every real run writes an output directory such as `out/demo-local/`:
 | `request_example.json` | The first request body, useful for debugging API compatibility. |
 | `prompt/` | Prompt text copied into the result directory when passed through Python. |
 
-### 6.1 Check whether the run completed cleanly
+### 7.1 Check whether the run completed cleanly
 
 ```bash
 python3 -m json.tool out/demo-local/summary.json
@@ -495,7 +549,7 @@ Exit codes have the same high-level meaning:
 | `3` | The run stopped with rows still missing. Re-run to resume. |
 | `4` | Colab only: final results were not fully mirrored to Drive. |
 
-### 6.2 Read individual answers
+### 7.2 Read individual answers
 
 `results.jsonl` contains one JSON object per recorded attempt. This standard-library
 snippet prints the useful fields:
@@ -526,7 +580,7 @@ Because the file is append-only, a retried row can have an older error followed 
 successful record. `summary.json` uses the latest record for each run key; raw line count
 is therefore not the same as final row count.
 
-### 6.3 Read rates by group
+### 7.3 Read rates by group
 
 ```bash
 python3 - <<'PY'
@@ -549,7 +603,7 @@ PY
 `rates` are raw shares among answered rows. `rates_weighted` use each item's `weight`
 and are the appropriate figures when the items were sampled unequally by stratum.
 
-## 7. Common failures
+## 8. Common failures
 
 - **Missing template field:** add the named CSV column or JSONL field, or remove the
   placeholder from the user template. Reserved CSV columns (`id`, `group`, `stratum`,

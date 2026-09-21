@@ -136,6 +136,14 @@ Modes
               two replicas of one model, `--mode compare --limit 200` is the agreement
               check.
 
+    Both split work inside one process, over endpoints it can see. `--part k/n` splits it
+    across processes that cannot share a queue -- two Colab runtimes, two machines. The
+    send order is shuffled, so `--part 1/2` and `--part 2/2` are disjoint random halves
+    of the pool and together are all of it. Give each part its own --out: one directory
+    is one process, and two appending to one results.jsonl tear each other's lines.
+    `cat */results.jsonl` afterwards is the whole run, because a row's key does not
+    depend on which part sent it.
+
 Endpoints
     One server needs no files. The key goes in --api-key or LLMJUDGE_API_KEY:
 
@@ -753,6 +761,24 @@ def load_items(path: str, seed: int, columns: tuple[str, ...] = ()) -> tuple[lis
     return items, file_sha(path), buf.getvalue()
 
 
+def part_of(items: list[Item], spec: str) -> list[Item]:
+    """`k/n` -> the k-th nth of the send order, 1-based.
+
+    The order is already shuffled, so a part is a random sample of the pool, the parts
+    are disjoint, and together they are all of it. That is what lets two runtimes judge
+    one pool without sharing a queue: `--part 1/2` in one, `--part 2/2` in the other.
+    Splitting the items file by hand does not work, because `make-items` writes it sorted
+    by id -- the first half of the file is the first table, not a random half.
+    """
+    try:
+        k, n = (int(x) for x in spec.split("/"))
+    except ValueError:
+        raise ConfigError(f"--part is k/n, like 2/4; got {spec!r}") from None
+    if not 1 <= k <= n:
+        raise ConfigError(f"--part {spec}: k is between 1 and n")
+    return items[len(items) * (k - 1) // n:len(items) * k // n]
+
+
 def row_key(item_id: str, model: str, prompt: dict,
             endpoint: str = "", guided: bool = True) -> str:
     """What resume is keyed on. Changing any part of it means a row is sent again.
@@ -806,7 +832,7 @@ PINNED_DEFAULTS: dict = {}
 UNPINNED_DECODING = ("max_tokens",)
 # Re-stated every session instead, so run.json describes the pool that is there now and
 # the sessions list keeps the history.
-RESTATED = ("items", "items_sha", "items_rows", "order_sha", "decoding")
+RESTATED = ("items", "items_sha", "items_rows", "order_sha", "decoding", "part")
 
 
 def check_run_json(out: str, meta: dict, session: dict) -> None:
@@ -835,6 +861,7 @@ def summarise(results_path: str, meta: dict) -> dict:
     label = meta.get("label")
     values = meta.get("values") or sorted({r["verdict"] for r in recs if r.get("verdict")})
     out: dict = {"prompt": meta["prompt"], "items": meta.get("items"), "mode": meta["mode"],
+                 "part": meta.get("part"),
                  "label": label, "values": values,
                  "rows": len(recs), "lines": lines, "unreadable_lines": bad,
                  "parse_errors": sum(bool(r.get("parse_error")) for r in recs),
@@ -1815,6 +1842,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                          "come back sound, so the endpoint is still proven before any row")
     ap.add_argument("--mode", choices=["shard", "compare"], default="shard")
     ap.add_argument("--limit", type=int, default=0, help="only the first N rows of the send order")
+    ap.add_argument("--part", default="",
+                    help="judge one part of the pool and leave the rest: 1/2 is the "
+                         "first half of the send order, 3/4 the third quarter. For "
+                         "splitting a pool across processes that cannot share a queue; "
+                         "give each part its own --out")
     ap.add_argument("--retry-errors", action="store_true",
                     help="re-send rows whose latest record is an error or parse error")
     ap.add_argument("--guided", choices=["on", "off"], default="on",
@@ -1953,7 +1985,7 @@ def run_main(args: argparse.Namespace) -> int:
             "label": prompt["label"], "values": prompt["values"],
             "decoding": decoding, "order_seed": args.seed, "order_sha": sha(order_csv),
             "items": rel(items_path), "items_sha": items_sha, "items_rows": len(items),
-            "mode": args.mode}
+            "mode": args.mode, "part": args.part or None}
     session = {"started": now_iso(), "argv": sys.argv[1:] if __name__ == "__main__" else None,
                "script_sha": file_sha(os.path.abspath(__file__)), "dry_run": args.dry_run,
                "pid": os.getpid(),
@@ -1985,6 +2017,12 @@ def run_main(args: argparse.Namespace) -> int:
                build_payload(args.model or "<model from the endpoints file>", prompt,
                              user_text, decoding, args.extra, guided=guided,
                              drop=args.drop, stream=args.stream))
+    selected = items[:args.limit] if args.limit else items
+    if args.part:
+        selected = part_of(selected, args.part)
+        log(f"part {args.part}: {len(selected):,} of {len(items):,} rows, "
+            f"the rest is for the other parts")
+
     if args.dry_run:
         # No run.json here. It pins the prompt and the decoding for every later session,
         # and a dry run sends nothing, so there is no results.jsonl for it to protect.
@@ -2013,7 +2051,6 @@ def run_main(args: argparse.Namespace) -> int:
         log(f"results.jsonl: {torn} unusable line(s) ignored; those rows will be re-sent")
     skip = {k for k, r in latest.items()
             if not (args.retry_errors and (r.get("error") or r.get("parse_error")))}
-    selected = items[:args.limit] if args.limit else items
 
     def key_for(it: Item, model: str, endpoint: str = "") -> str:
         return row_key(it.id, model, prompt, endpoint, guided)

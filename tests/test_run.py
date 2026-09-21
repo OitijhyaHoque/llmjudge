@@ -435,6 +435,26 @@ class ItemsTests(unittest.TestCase):
             self.assertIn(":2:", str(cm.exception))
             self.assertIn('"weight" must be', str(cm.exception))
 
+    def test_parts_are_disjoint_and_cover_the_pool(self):
+        """Two runtimes that cannot share a queue still judge each row exactly once."""
+        with tempfile.TemporaryDirectory() as d:
+            items, _, _ = cj.load_items(write_items(d), 42)
+        for n in (2, 3, 4, 7):
+            with self.subTest(n=n):
+                parts = [cj.part_of(items, f"{k}/{n}") for k in range(1, n + 1)]
+                ids = [i.id for p in parts for i in p]
+                self.assertEqual(ids, [i.id for i in items])       # disjoint, in order
+                self.assertEqual(len(set(ids)), len(items))
+                self.assertLessEqual(max(len(p) for p in parts)
+                                     - min(len(p) for p in parts), 1)
+        self.assertEqual([i.id for i in cj.part_of(items, "1/4")],
+                         [i.id for i in items[:len(items) // 4]])  # 1/n is the prefix
+
+    def test_a_bad_part_is_refused(self):
+        for spec in ("2", "0/4", "5/4", "-1/4", "a/b", "1/2/3", "1/0"):
+            with self.subTest(spec), self.assertRaises(cj.ConfigError):
+                cj.part_of([], spec)
+
     def test_a_csv_is_checked_against_the_prompt_columns_too(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "rows.csv")
@@ -532,6 +552,26 @@ class RunTests(RunBase):
             summary = json.load(f)
         self.assertEqual((summary["rows"], summary["missing"]), (POOL_ROWS, 0))
         self.assertFalse(os.path.exists(os.path.join(self.out, "judge.pid")))
+
+    def test_parts_split_one_pool_across_processes(self):
+        """Two runtimes that cannot share a queue: one part each, one directory each, and
+        the two results files together are the pool, every row once."""
+        outs = [os.path.join(self.root, f"part{k}") for k in (1, 2)]
+        for k, out in enumerate(outs, 1):
+            self.assertEqual(self.judge("--part", f"{k}/2", "--out", out), cj.EXIT_OK)
+        recs, rows = [], 0
+        for out in outs:
+            recs += read_lines(os.path.join(out, "results.jsonl"))
+            with open(os.path.join(out, "summary.json")) as f:
+                summary = json.load(f)
+            self.assertEqual(summary["missing"], 0)
+            self.assertEqual(summary["part"], f"{outs.index(out) + 1}/2")
+            rows += summary["rows"]
+        self.assertEqual(rows, POOL_ROWS)
+        self.assertEqual(len({r["id"] for r in recs}), POOL_ROWS)
+        # A key does not depend on which part sent the row, so the concatenation is
+        # one run's results.jsonl and summarises as one.
+        self.assertEqual(len({r["key"] for r in recs}), POOL_ROWS)
 
     def test_a_prompt_from_strings_in_a_notebook(self):
         """A colleague pastes two strings into a cell; nothing is checked out, and the
