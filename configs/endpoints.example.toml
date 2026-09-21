@@ -45,14 +45,14 @@
 # Every endpoint here must speak the OpenAI chat-completions body: a messages array with
 # the system prompt as its first message, and response_format for guided decoding. An API
 # with a body of its own -- Anthropic's native /v1/messages, where the system prompt is a
-# top-level field -- needs an adapter, not these keys. That is step 4 of the plan.
+# top-level field -- needs an adapter, not these keys.
 #
 # Every endpoint a run may use must be listed here when the run starts. Its URL may come
 # later: an endpoint whose url_key is not in its env file yet waits, and joins as soon as
 # the key appears (checked every few seconds).
 
-# ---- Colab notebooks: notebooks/serve_vllm.py, vLLM 0.29.0, --max-num-seqs 16,
-#      Cloudflare tunnel
+# ---- Colab notebooks: llmjudge/serve_vllm.py, vLLM 0.29.0, --max-num-seqs 16,
+#      behind a Cloudflare tunnel
 
 [[endpoint]]
 name = "colab-a"
@@ -92,7 +92,8 @@ concurrency = 4
 max_concurrency = 8
 # What a run may spend here is capped with --max-requests, on the command line.
 
-# ---- ngrok on the DGX Spark: disabled since the move to Cloudflare
+# ---- Two ngrok tunnels to a self-hosted box. Disabled; kept as an example of an
+#      endpoint pair that is not Colab.
 
 [[endpoint]]
 name = "spark-a"

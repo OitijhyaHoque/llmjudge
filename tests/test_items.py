@@ -1,9 +1,9 @@
 """make-items: selection, stratification, weights, and the refusals.
 
-The falsifiable check that this reproduces `judge-0/scripts/make_items.py` needs the
-2.9 GB `runs/` tree and cannot live here. It was run on 2026-09-21 over three pools --
-pilot (100 rows), full (55,039) and the reference pool (5,500, kept=3000) -- and all
-three came out byte for byte identical. `notes/20260921_102042-llmjudge-plan.md` §2.
+These run on small synthetic CSVs. The check that make-items reproduces the pools drawn
+by the earlier standalone script needs a 2.9 GB tree of real runs and so cannot live
+here; it was run separately on 2026-09-21 over three pools -- 100, 55,039 and 5,500 rows
+-- and all three came out byte for byte identical.
 """
 
 import csv

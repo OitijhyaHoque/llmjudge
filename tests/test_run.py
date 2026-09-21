@@ -272,7 +272,7 @@ class ParserTests(unittest.TestCase):
         self.assertIn("parse_error", cj.parse_strict('{"verdict": "consistent"}', c))
 
     def test_a_nested_answer_shape(self):
-        """c1 answers with an array of findings; that used to be unloadable."""
+        """c1 answers with an array of findings, so the schema must allow one."""
         c = cj.load_prompt("c1")["contract"]
         self.assertEqual((c["order"], c["label"]), (("verdict", "findings"), "verdict"))
         items = c["schema"]["properties"]["findings"]["items"]
@@ -373,8 +373,8 @@ class ItemsTests(unittest.TestCase):
                 self.assertIn(expected, str(cm.exception))
 
     def test_every_row_is_checked_against_the_prompt_columns(self):
-        """Not only the first one: the row that cannot be rendered used to be found
-        mid-run, with the model already warm."""
+        """Every row, not only the first. Otherwise the row that cannot be rendered is
+        found mid-run, with the model already warm."""
         with tempfile.TemporaryDirectory() as d:
             path = self._write(
                 d,
@@ -833,9 +833,8 @@ class ResumeSettingsTests(RunBase):
         self.assertEqual(self.judge("--temperature", "0.7"), cj.EXIT_CONFIG)
 
     def test_an_unusable_results_line_does_not_stop_the_run(self):
-        """A line with no "key" used to raise KeyError before a single row was sent. Files
-        edited by hand, and files from a judge older than the items interface, look like
-        this."""
+        """A line with no "key" must not raise before a single row is sent. A file torn
+        by a hard kill, or edited by hand, looks like this."""
         os.makedirs(self.out, exist_ok=True)
         with open(os.path.join(self.out, "results.jsonl"), "w") as f:
             f.write('{"id": "ctgan_split:1", "verdict": "consistent"}\n')    # no key

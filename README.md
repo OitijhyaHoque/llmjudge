@@ -12,10 +12,10 @@ Both halves are here, and nothing outside this repository is needed to run eithe
 colleague with a different dataset — or no rules at all — uses it unchanged: `make-items`
 reads ordinary CSV columns, and the judge sees only `fields`.
 
-Rule authoring and the evaluation pipeline live elsewhere (`rule-builder`, `judge-0`).
-The line to them is **files on disk, never an import**: they produce a `table.csv` and
-optionally an attributes CSV, and they read `results.jsonl` back. Nothing here imports
-from them, and the seven prompts that ship are Diabetes 130 examples, not a dependency.
+Whatever authors the rules and whatever reads the verdicts back stay outside. The line
+to them is **files on disk, never an import**: they write a `table.csv` and optionally an
+attributes CSV, and they read `results.jsonl` back. Nothing here imports from them, and
+the seven prompts that ship are Diabetes 130 examples, not a dependency.
 
 ## Quickstart
 
@@ -29,7 +29,7 @@ cp configs/endpoints.example.toml configs/endpoints.toml
 python3 -m unittest discover -s tests -t .            # 87 tests, ~33s, no server needed
 
 llmjudge make-items --spec configs/pool.diabetes130.toml --pool pilot \
-    --root /path/to/judge-0 --out items.jsonl         # draw the pool
+    --root /path/to/your/runs --out items.jsonl       # draw the pool
 llmjudge --items items.jsonl --out out/pilot \
     --prompt c3 --run-tag pilot-01 --dry-run          # check it before spending a GPU
 ```
@@ -68,10 +68,10 @@ out, and nothing else is ever uploaded. One items file, once:
 
 ```bash
 llmjudge make-items --spec configs/pool.diabetes130.toml --pool pilot \
-    --root ../judge-0 --out ~/drive/items-pilot.jsonl
+    --root /path/to/your/runs --out items-pilot.jsonl
 ```
 
-Upload that to `MyDrive/genmd-judge/` at drive.google.com — 114 KB for the pilot.
+Upload that to `MyDrive/judge/` at drive.google.com — 114 KB for the pilot.
 
 Two Colab Secrets (key icon in the sidebar, then toggle notebook access): `GH_TOKEN`, a
 fine-grained PAT with **Contents: Read-only** scoped to this one repo, and `HF_TOKEN` for
@@ -89,8 +89,7 @@ slow reply and the timeout defaults to 600 s instead of 95. Every other option i
 `judge()`'s, spelled the same way.
 
 **Re-running the cell resumes.** Whatever the last session left on Drive is copied back
-down first, so a recycled runtime costs only the requests that were in flight. There are
-no bundles and no zips.
+down first, so a recycled runtime costs only the requests that were in flight.
 
 **The mirror is verified, not assumed.** A copy that fails mid-run prints its error and
 carries on, which is right while there is still time to recover. At exit the line counts
@@ -142,8 +141,7 @@ is written, and the answers already on disk stay, so a re-run picks up where it 
 
 The base URL is used as you write it. A URL that already carries a path keeps that path,
 so Azure's deployment URL and a gateway's prefix work; only a bare host gets `/v1`
-appended, which is what every vLLM URL looked like before. A query string stays at the
-end, where Azure wants its `api-version`.
+appended. A query string stays at the end, where Azure wants its `api-version`.
 
 Three more knobs move the rest of the request, and each also works per entry in the
 endpoints file (`chat_path`, `auth_header`, `headers`, `models_path`):
@@ -169,10 +167,11 @@ llmjudge --base-url 'https://R.openai.azure.com/openai/deployments/D?api-version
     --model gpt-4o-mini --auth-header api-key --skip-model-check --drop seed ...
 ```
 
-What none of this changes is the **body**: a `messages` array with the system prompt as its
-first message, and `response_format` for guided decoding. An API with a body of its own —
-Anthropic's native `/v1/messages`, where the system prompt is a top-level field and there
-is no `response_format` — needs an adapter, which is step 4 of the plan, not these flags.
+What none of this changes is the **body**: a `messages` array with the system prompt as
+its first message, and `response_format` for guided decoding. An API with a body of its
+own — Anthropic's native `/v1/messages`, where the system prompt is a top-level field and
+there is no `response_format` — needs an adapter, not these flags. See *What is still to
+do*.
 
 ### When the API does not take the same fields
 
@@ -224,10 +223,12 @@ judge(items="/content/drive/MyDrive/judge/items.jsonl",
 `judge()` takes every command-line option with underscores (`max_tokens`, `retry_errors`,
 `dry_run`, `base_url`, `model`), a dict option as JSON (`extra={"top_p": 0.9}`) and a list
 option as a repeated flag (`drop=["seed"]`). It works inside a Colab or Jupyter cell,
-which runs in an event loop of its own. `system=` and `user=` are the prompt text, or the path to a file holding it —
-a value that names an existing file is read, anything else is the prompt. The text is
-copied to `<out>/prompt/`, so a results directory always carries the prompt that produced
-it, and re-running the same cell resumes rather than starts again.
+which runs in an event loop of its own.
+
+`system=` and `user=` are the prompt text, or the path to a file holding it: a value that
+names an existing file is read, anything else is the prompt itself. The text is copied to
+`<out>/prompt/`, so a results directory always carries the prompt that produced it, and
+re-running the same cell resumes rather than starts again.
 
 ### The answer shape comes from your prompt
 
@@ -307,7 +308,7 @@ selection and stratification without ever reaching the model:
 
 ```bash
 llmjudge make-items --spec configs/pool.diabetes130.toml --pool full \
-    --root /path/to/judge-0 --out items/full.jsonl
+    --root /path/to/your/runs --out items/full.jsonl
 ```
 
 The spec names the tables, the groups (`select` by column value, `stratum` by format
@@ -357,8 +358,9 @@ not the items file. Append 2,000 rows to the file, re-run into the same director
 only the new ids are sent. `run.json` restates which pool each session ran.
 
 **Refusal on a changed run.** The first real run writes `<out>/run.json`, which pins the
-prompt, the schema, the sampling settings, the send-order seed and the mode. A restart into that directory with any of them
-changed is refused rather than quietly mixing two kinds of answer in one file.
+prompt, the schema, the sampling settings, the send-order seed and the mode. A restart
+into that directory with any of them changed is refused, rather than quietly mixing two
+kinds of answer in one file.
 
 `--max-tokens` is the one setting you may change. A reply cut off at the budget is recorded
 as an error and never as a verdict, so no answer on disk was shaped by the old budget:
@@ -377,14 +379,15 @@ when a step buys nothing, and halves on 429 or timeout. Bounds come from the end
 file; keep `max_concurrency` at or below vLLM's `--max-num-seqs`.
 
 **Preflight.** The whole items file is parsed and checked before a single request goes
-out — ids present and unique, `fields` an object, and **every row** carrying every
-`{column}` the prompt names — so a pool malformed on line 40,000 costs nothing rather than
+out: ids present and unique, `fields` an object, and **every row** carrying every
+`{column}` the prompt names. So a pool malformed on line 40,000 costs nothing rather than
 four hours. A field value may be a string, a number, or a nested list or object; a number
-is rendered as it reads, and anything nested is written as JSON rather than as Python. Then,
-per endpoint: the model listing must name the configured model — unless
+is rendered as it reads, and anything nested is written as JSON rather than as Python.
+
+Then, per endpoint: the model listing must name the configured model — unless
 `--skip-model-check` says this API has no such listing — and a canary request must come
-back sound. Under guided decoding the canary's schema admits one value,
-so a server silently ignoring `response_format` is refused rather than producing a run of
+back sound. Under guided decoding the canary's schema admits one value, so a server
+silently ignoring `response_format` is refused rather than producing a whole run of
 unconstrained replies.
 
 **No row can hang the run.** Anything raised while rendering or sending a row is recorded
@@ -393,10 +396,11 @@ costs one row rather than stalling a pool that can never finish.
 
 **Nothing is lost quietly.** A truncated reply (`finish_reason=length`) is recorded as an
 error, never as a verdict. Non-JSON or wrong-key replies are retried once, then recorded
-with `parse_error`. Exit codes: `0` every planned row recorded, `2` configuration refused,
-`4` (from `colab.run()` only) the rows were judged but are not all on Drive,
-`3` stopped incomplete. Ctrl-C once drains the in-flight requests and writes the summary;
+with `parse_error`. Ctrl-C once drains the in-flight requests and writes the summary;
 twice exits immediately, and every recorded line is already on disk.
+
+Exit codes: `0` every planned row recorded, `2` configuration refused, `3` stopped
+incomplete, `4` (from `colab.run()` only) the rows were judged but are not all on Drive.
 
 ## Secrets
 
@@ -409,22 +413,16 @@ Never in the source, never in a notebook body.
 | Colab | **Colab Secrets** (key icon in the sidebar), read with `userdata.get` |
 | the served endpoint's own key | generated fresh per session by `llmjudge/serve_vllm.py` |
 
-The vLLM API key is no longer a constant. The tunnel hostname is random per session
-anyway, so a fixed key bought nothing and could only leak.
+The served endpoint's key is generated per session rather than fixed, so nothing
+long-lived can leak out of a shared notebook.
 
 ## What is still to do
 
-The extraction, the items interface and the pool builder are done; see
-`notes/20260921_102042-llmjudge-plan.md` for the corrected plan. What is left:
-
-1. **One provider shape.** The request body is OpenAI chat-completions, always, so
-   `--chat-path` cannot actually reach Anthropic or OpenAI's `/responses`. A `providers.py`
-   adds the second shape.
+1. **One provider shape.** The request body is always OpenAI chat-completions, so
+   `--chat-path` alone cannot reach Anthropic or OpenAI's `/responses`. A second body
+   shape needs an adapter module.
 2. **The repo is not pushed yet.** `notebooks/run_judge.ipynb` installs
    `git+https://…@github.com/{REPO}.git@{TAG}`, so it needs the remote added, `main`
    pushed, `v0.1.0` tagged, and `REPO` set in the notebook's first cell.
-3. **`notebooks/judge_local.py` is a second, incompatible judge** and is described above as
-   a reference loop, which it is not. Delete it or rewrite it.
-
-Runs made before the items interface keyed resume on `(table sha, arm, row index)`. They do
-not resume here, by decision; their `results.jsonl` stays readable.
+3. **`notebooks/judge_local.py` is a second, incompatible judge.** It is described above
+   as a reference loop, which it is not. Delete it or rewrite it.

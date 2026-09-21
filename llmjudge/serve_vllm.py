@@ -1,8 +1,10 @@
 # ============================================================
-# MedGemma IT + vLLM + Cloudflare Tunnel
-# FINAL COLAB CELL — TEXT ONLY
+# Serve MedGemma IT with vLLM, behind a Cloudflare tunnel.
 #
-# Replaces ngrok with cloudflared (no monthly request cap).
+# Run this as one Colab cell. Text only: the vision tower is
+# not loaded. It prints the public URL and a fresh API key,
+# and exports both so a judge cell in the same notebook needs
+# no arguments about the server.
 # ============================================================
 
 import os
@@ -76,9 +78,9 @@ subprocess.run(
 )
 
 
-# Colab's torchaudio can be compiled against a different CUDA
-# version from the PyTorch installed by vLLM.
-# We do not need audio at all.
+# Colab's torchaudio may be built against a different CUDA
+# version from the PyTorch that vLLM installs. No audio is
+# needed here, so remove it.
 print("[2/8] Removing incompatible torchaudio...")
 
 subprocess.run(
@@ -96,10 +98,9 @@ subprocess.run(
 )
 
 
-# Gemma 3 architecture inspection requires torchvision even
-# when --language-model-only is used.
-#
-# Match the PyTorch 2.13 / CUDA 13 stack installed by vLLM.
+# Gemma 3 needs torchvision to inspect the architecture, even
+# with --language-model-only. Match the PyTorch 2.13 / CUDA 13
+# stack that vLLM installs.
 print("[3/8] Installing matching torchvision...")
 
 subprocess.run(
@@ -198,9 +199,9 @@ subprocess.run(
 LOG_PATH = "/content/vllm-medgemma.log"
 
 
-# Protect the public endpoint. Generated fresh on every run: the tunnel hostname is
-# random per session anyway, so a fixed key bought nothing and could only leak. It is
-# printed below and picked up automatically by the judge cell.
+# Protects the public endpoint. Generated fresh on every run, so nothing long-lived can
+# leak from a shared notebook. It is printed below, and the judge cell picks it up from
+# the environment.
 API_KEY = secrets.token_urlsafe(32)
 
 
@@ -368,18 +369,18 @@ if not PUBLIC_URL:
     raise RuntimeError("cloudflared did not produce a URL.")
 
 
-# The hostname is random on every run.
-# Write it out so other scripts can pick it up.
+# The hostname is random on every run, so write it out for
+# anything else that needs it.
 with open(URL_FILE, "w") as f:
     f.write(PUBLIC_URL)
 
 os.environ["MEDGEMMA_BASE_URL"] = f"{PUBLIC_URL}/v1"
 os.environ["MEDGEMMA_API_KEY"] = API_KEY
 
-# What llmjudge.colab.run() reads, so a judge cell in this same notebook needs no
-# arguments about the server at all. The URL here is localhost, not the tunnel: a judge
-# running in this runtime should not leave it and come back through Cloudflare, which
-# would cut any reply the model spends more than ~100 s on.
+# What llmjudge.colab.run() reads, so a judge cell in this notebook needs no arguments
+# about the server. The URL here is localhost, not the tunnel: a judge in this runtime
+# should not leave it and come back through Cloudflare, which cuts any reply the model
+# spends more than ~100 s on.
 os.environ["LLMJUDGE_BASE_URL"] = f"http://127.0.0.1:{PORT}/v1"
 os.environ["LLMJUDGE_API_KEY"] = API_KEY
 os.environ["LLMJUDGE_MODEL"] = SERVED_MODEL

@@ -3,9 +3,8 @@
 
     llmjudge make-items --spec configs/pool.diabetes130.toml --pool full --out items.jsonl
 
-Choosing which rows to judge is sampling, not judging, so it could have lived somewhere
-else. It lives here because the only thing it needs is CSV columns -- no card, no checks,
-no knowledge tables -- and a separate home for it made a dead repository load-bearing.
+Choosing which rows to judge is sampling, not judging. It lives here because the only
+thing it needs is CSV columns: no card, no checks, no knowledge tables.
 
 A spec names its tables and its groups. A table is a CSV of rows to judge, optionally
 paired with a second CSV of per-row attributes (a rules `decisions.csv`, a labelling, a

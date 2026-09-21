@@ -3,9 +3,9 @@
     make-items   CSV + a pool spec -> items.jsonl
     judge        items.jsonl -> results.jsonl + summary.json
 
-It holds no rules, no cards and no knowledge tables: those live in `rule-builder`
-(authoring) and `judge-0` (the evaluation pipeline). The interface across that line is
-files on disk, never an import, in both directions.
+It holds no rules, no cards and no knowledge tables. Whatever authors the rules and
+whatever reads the verdicts back stay outside: the interface is files on disk, never an
+import, in both directions.
 """
 
 from .run import judge, main

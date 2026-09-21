@@ -1,7 +1,7 @@
 # The Diabetes 130 pool, as an example of the spec shape.
 #
 #   llmjudge make-items --spec configs/pool.diabetes130.toml --pool full \
-#       --root /path/to/judge-0 --out items/full.jsonl
+#       --root /path/to/your/runs --out items/full.jsonl
 #
 # Paths are relative to --root (default: this file's directory). Nothing here is read by
 # the judge: it sees `fields` and nothing else, so `kept`, `decision` and `checks` steer

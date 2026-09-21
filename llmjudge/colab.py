@@ -8,17 +8,16 @@ not reliable under append, which is why the results are not simply written there
 
     from llmjudge.colab import run
 
-    run(items="drive:genmd-judge/items.jsonl",
-        out="drive:genmd-judge/results/pilot",
+    run(items="drive:judge/items.jsonl",
+        out="drive:judge/results/pilot",
         run_tag="pilot-01", prompt="c3", limit=100)
 
-Nothing is pasted in: `drive:` is `MyDrive/`, and the URL, key and model name come from
-the serving cell, which exported them. Re-running the cell resumes -- whatever the last
-session left on Drive is copied back down first, and a row already answered is never
-sent again.
+Nothing is pasted in. `drive:` means `MyDrive/`, and the URL, key and model name come
+from the serving cell, which exported them. Re-running the cell resumes: whatever the
+last session left on Drive is copied back down first, and a row already answered is
+never sent again.
 
-There are no bundles and no zips. The items file is the only thing a colleague puts on
-Drive, and the code comes from a tag:
+The items file is the only thing that goes on Drive. The code comes from a tag:
 
     pip install "git+https://$GH_TOKEN@github.com/<org>/llmjudge.git@v0.1.0"
 """
@@ -36,16 +35,15 @@ MYDRIVE = os.path.join(DRIVE_ROOT, "MyDrive")
 LOCAL_ROOT = "/content"
 BACKUP_EVERY = 100                     # seconds between copies to Drive
 
-# Where the model is, in the order the names are looked at. `llmjudge/serve_vllm.py`
-# exports the LLMJUDGE_* names, so a cell that has just started a server needs to say
-# nothing at all. The MEDGEMMA_* names are what the older notebooks exported and they
-# still work.
+# Where the model is, in the order the names are tried. `llmjudge/serve_vllm.py` exports
+# the LLMJUDGE_* names, so a cell that has just started a server needs to say nothing at
+# all. The MEDGEMMA_* names are the older ones and still work.
 ENV_BASE_URL = ("LLMJUDGE_BASE_URL", "MEDGEMMA_BASE_URL")
 ENV_API_KEY = ("LLMJUDGE_API_KEY", "MEDGEMMA_API_KEY")
 ENV_MODEL = ("LLMJUDGE_MODEL", "MEDGEMMA_MODEL")
 
-# The judge's own codes are 0 ok, 2 refused, 3 incomplete. This one is: the rows were
-# judged, but they are not all on Drive, so the run is not safe to walk away from.
+# The judge's own codes are 0 ok, 2 refused, 3 incomplete. This one means the rows were
+# judged but are not all on Drive, so the run is not safe to walk away from.
 EXIT_MIRROR = 4
 
 
@@ -69,7 +67,7 @@ def mount(root: str = DRIVE_ROOT) -> bool:
 
 
 def resolve(path: str) -> str:
-    """`drive:genmd-judge/x` -> `/content/drive/MyDrive/genmd-judge/x`.
+    """`drive:judge/x` -> `/content/drive/MyDrive/judge/x`.
 
     Any other path is used as it is written, so the same cell works off Colab."""
     if path.startswith("drive:"):
@@ -97,10 +95,10 @@ def restore(remote: str, local: str) -> int:
 def sync(local: str, remote: str) -> list[tuple[str, str]]:
     """Copy `local` to `remote`. -> [(file, error)] for whatever could not be copied.
 
-    A `.jsonl` file is copied by its new tail only. `results.jsonl` is append-only and
-    can hold 50,000 rows, and re-uploading all of it every hundred seconds would spend
-    the whole run pushing bytes Drive already has. Everything else is small and is
-    copied whole when it changes.
+    Only the new tail of a `.jsonl` file is copied. `results.jsonl` is append-only and
+    can hold 50,000 rows, so re-uploading all of it every hundred seconds would spend the
+    run pushing bytes Drive already has. Everything else is small and is copied whole
+    when it changes.
     """
     problems: list[tuple[str, str]] = []
     for root, _, names in os.walk(local):
@@ -154,8 +152,8 @@ def from_env(names: tuple[str, ...]) -> str:
 def from_secrets(name: str) -> str:
     """A Colab Secret (the key icon in the sidebar), or "".
 
-    Every failure is the same answer -- not Colab, no such secret, notebook access not
-    granted -- and each raises a different Colab-internal exception, so they are caught
+    Not Colab, no such secret, notebook access not granted: every failure means the same
+    thing here, and each raises a different Colab-internal exception, so they are caught
     together."""
     try:
         from google.colab import userdata
@@ -251,9 +249,9 @@ def run(items: str, out: str, run_tag: str, system: str | None = None,
     if not on_drive:
         return code
 
-    # The mirror is verified, not assumed. A sync that failed mid-run printed its error
-    # and carried on, which is right while there is time to recover and wrong at the end:
-    # a run whose answers are only on a runtime that is about to be recycled has to say so.
+    # The mirror is verified, not assumed. A sync that fails mid-run prints its error and
+    # carries on, which is right while there is still time to recover. At the end it is
+    # not: a run whose answers sit only on a runtime about to be recycled must say so.
     problems = report(sync(local_out, drive_out))
     here = lines(os.path.join(local_out, "results.jsonl"))
     there = lines(os.path.join(drive_out, "results.jsonl"))

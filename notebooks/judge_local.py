@@ -1,10 +1,12 @@
 """
-The minimal shape of the contract, kept as the readable reference: items.jsonl in,
-verdicts.jsonl out, keyed on "id", resumable by re-running. `llmjudge/run.py` is the
-production version of this loop -- endpoint pool, circuit breakers, adaptive window --
-and step 2 of the plan makes it read and write exactly these two files.
+The minimal shape of the contract: items.jsonl in, verdicts.jsonl out, keyed on "id",
+resumable by re-running. `llmjudge/run.py` is the production version of this loop, with
+an endpoint pool, circuit breakers and an adaptive window.
 
-Run this on YOUR machine, not in Colab.
+This file does not yet read and write the same two files as `llmjudge/run.py`; see
+"What is still to do" in the README.
+
+Run this on your own machine, not in Colab.
 
     pip install openai
     export MEDGEMMA_BASE_URL="https://<random>.trycloudflare.com/v1"

@@ -1,151 +1,158 @@
 #!/usr/bin/env python3
-"""Whole-row judge over vLLM's OpenAI-compatible API, with or without guided decoding.
+"""Judge rows with an LLM over an OpenAI-compatible API.
 
-Built from `scripts/c2_judge.py`; the pool, the endpoint pool, resume and the failure
-handling are unchanged. What is new is `--guided off`, for prompts that reason in plain text
-before they answer (`prompts/c3-reasoning`), which no JSON schema can hold.
+    python3 -m llmjudge --items items.jsonl --out out/pilot --prompt c3 \\
+        --run-tag pilot-01 --dry-run              # render the prompt, send nothing
+    python3 -m llmjudge --items items.jsonl --out out/pilot --prompt c3 \\
+        --run-tag pilot-01
+    nohup python3 -m llmjudge --items items.jsonl --out out/c3r --prompt c3-reasoning \\
+        --guided off --run-tag c3r-01 >> out/c3r.log 2>&1 &
 
-    --guided on    the default. `response_format` carries the schema read from the
-                   prompt's JSON example, and the reply must be exactly that object, in
-                   the example's key order. This is c2_judge's
-                   behaviour, down to the resume keys, so a c2 run resumes under this script.
-    --guided off   no `response_format` at all. The reply may carry reasoning in plain text;
-                   the verdict is the LAST JSON object with a `verdict` key, so prose and code
-                   fences around it are tolerated, and the text before it is kept as
-                   `reasoning`. --max-tokens then defaults to 1024, not 96, because the
-                   reasoning has to fit: a truncated reply is recorded as an error, never a
-                   verdict. 1024 is measured, not guessed -- see below.
+One row per request, temperature 0. The row is rendered into the prompt's `user.md`. The
+model never sees the row's id, group or stratum.
 
-Sizing --max-tokens without a grammar. On MedGemma 27B IT the only thing that held the reply
-short in earlier runs was the grammar, so the budget has to come from the unguided runs:
+Items (`--items`, one JSON object per line)
 
-    run                    guided  completion_tokens p50 / p90 / max
-    runs/c1/ngrok-27b-c1r     yes             537 /  780 /  931
-    runs/c1/ngrok-27b-c1r-stream  no         1824 / 2232 / 2476   (thinking trigger on)
+    {"id": "ctgan_split:41772", "fields": {"age": "[70-80)", "diag_1": "250.83"}}
 
-The unguided run is an upper bound in two ways: it ran c1r, whose reasoning field walks 45
-columns and emits a findings array, and it appended the thinking trigger, so most of those
-tokens are a `<unused94>thought` span. c3-reasoning asks for four lines and at most 120 words
-(~250 tokens) and does not trigger thinking. 1024 is ~4x that, and still well inside the
---timeout 95 s budget; 2048+ would be caught by the timeout, not by max_tokens, and cost a
-retry. Check `truncated` in summary.json after a pilot before raising it.
+    id       required, unique. The only thing tying a verdict back to a row, and this
+             script never parses it.
+    fields   required. Filled into the `{column}` placeholders of the user template. A
+             template naming a field an item lacks is refused before anything is sent.
+    group    optional, opaque. It buckets `summary.json`; nothing here reads its meaning.
+    stratum  optional, opaque. The same.
+    weight   optional, default 1.0. It weights the rates in the summary, so a caller that
+             sampled strata unequally can still report a population rate.
 
-Plan: `notes/i-0093-02/newplan.md` §3-§6. One row per request: the whole row rendered into
-`prompts/<prompt>/user.md`, temperature 0. The model never sees the arm or the row index.
+    Rows are sent in one seeded shuffled order, so any prefix of a run is a random sample
+    of the items file. Building that file is the caller's job: stratifying a pool needs
+    to know what a rule decided about each row, and this repository holds no rules.
 
-Streaming
-    --stream reads a reply as server-sent events and assembles it. Cloudflare cuts a
-    request whose origin has sent nothing for ~100 s (524), so a prompt that reasons
-    before it answers can lose a row the model is still working on. Streamed, --timeout
-    measures silence rather than the whole reply and may go past the tunnel's limit; the
-    answer, its token counts and its finish reason are the same either way. Off by
-    default; `stream = true` sets it for one endpoint.
+Guided decoding
+    --guided on, the default, sends the answer's JSON schema as `response_format`. The
+    reply must be exactly that object, in the key order the prompt's example shows.
+
+    --guided off sends no schema, so a prompt may reason in plain text before it answers
+    (`prompts/c3-reasoning`). The verdict is then the last JSON object in the reply that
+    carries the label key, so prose and code fences around it are fine, and the text
+    before it is kept as `reasoning`.
+
+    Unguided replies are long, so --max-tokens defaults to 1024 rather than 96. A reply
+    cut off at the budget is recorded as an error, never as a verdict. After a pilot,
+    read `truncated` in summary.json: if it is not 0, raise --max-tokens and re-run with
+    --retry-errors.
+
+Streaming (--stream)
+    Cloudflare cuts a request whose origin has sent nothing for about 100 s (524), so a
+    prompt that reasons before it answers can lose a row the model is still working on.
+    Streamed, --timeout measures silence rather than the whole reply and may go past the
+    tunnel's limit. The answer, its token counts and its finish reason are the same
+    either way. Off by default; `stream = true` turns it on for one endpoint.
 
 Throughput
     Nothing is sent in batches. Each endpoint keeps a window of in-flight requests and
     starts the next one the moment any finishes, so a 100 s row holds one slot while the
-    rest keep flowing; vLLM batches whatever is in flight on its side. The window adapts:
-    it grows (+25%) while measured throughput keeps rising, steps back when a step bought
-    nothing (the server is saturated), and halves on 429s and timeouts. Bounds come from
+    rest keep flowing. vLLM batches whatever is in flight on its side.
+
+    The window adapts. It grows by 25% while measured throughput keeps rising, steps back
+    when a step bought nothing, and halves on 429s and timeouts. The bounds come from
     `configs/endpoints.toml`. With `metrics = true` it also stops growing while vLLM
     reports queued requests; that is off by default, because every poll is one more
     request through the tunnel.
 
 Failures
-    endpoint down   connection errors, ngrok errors (ERR_NGROK_*), 502/503/504, Cloudflare
-                    520-523/525-527/530: the row goes back on the queue, the endpoint
-                    pauses, `/v1/models` + a canary are probed with backoff (--probe-min ..
-                    --probe-max), and it resumes on its own. In shard mode the other
-                    endpoint drains the queue meanwhile. Five timeouts or 5xx in a row also
-                    pause it, since a dead engine can still answer `/v1/models`.
+    endpoint down   connection errors, ngrok errors (ERR_NGROK_*), 502/503/504 and
+                    Cloudflare 520-523/525-527/530. The row goes back on the queue and the
+                    endpoint pauses. `/v1/models` and a canary are then probed with
+                    backoff (--probe-min .. --probe-max) until it comes back on its own.
+                    In shard mode the other endpoints drain the queue meanwhile. Five
+                    timeouts or 5xx in a row also pause it, because a dead engine can
+                    still answer `/v1/models`.
     new URL         while an endpoint is down its env file is re-read every few seconds,
-                    and a changed URL is probed at once. A Colab restart gets a new
-                    trycloudflare hostname: update .env and the running judge follows. An
-                    endpoint whose URL key is not in .env yet waits the same way, so a
-                    second notebook can join mid-run (its entry must be in the endpoints
-                    file from the start).
-    401 / 403       the env file is re-read (keys rotate) and the row retried once.
-    429, timeout    also Cloudflare 524 (origin silent ~100 s): window halved, row retried
-                    with jittered backoff, at most --max-attempts, then recorded as an
+                    and a changed URL is probed at once. So a Colab restart, which gets a
+                    new trycloudflare hostname, costs one edit to .env and the running
+                    judge follows. An endpoint whose URL key is not in .env yet waits the
+                    same way, so a second notebook can join mid-run -- as long as its
+                    entry was in the endpoints file when the run started.
+    401 / 403       the env file is re-read, since keys rotate, and the row is retried
+                    once.
+    429, timeout    also Cloudflare 524. The window halves and the row is retried with
+                    jittered backoff, at most --max-attempts times, then recorded as an
                     error.
-    400 / 422       recorded as an error for that row; 20 in a row refuses the endpoint.
-    bad reply       non-JSON or wrong keys: retried once, then recorded with parse_error.
-                    finish_reason=length is recorded as an error, never as a verdict.
-    ceiling         --max-requests N stops the whole run at N requests, rows, preflight
+    400 / 422       recorded as an error for that row. Twenty in a row refuse the
+                    endpoint.
+    bad reply       non-JSON, or the wrong keys: retried once, then recorded with
+                    parse_error. finish_reason=length is recorded as an error, never as a
+                    verdict.
+    ceiling         --max-requests N stops the whole run at N requests -- rows, preflight
                     and probes alike. It is what keeps a typo from judging 55,000 rows
-                    against a paid API. The stop is the Ctrl-C stop, so the answers
-                    already on disk stay and a re-run resumes from them.
+                    against a paid API. It stops the run the way Ctrl-C does, so the
+                    answers already on disk stay and a re-run resumes from them.
     gives up        only when every endpoint with work left has been down for
                     --give-up-after seconds, or none is usable.
 
-Preflight, per endpoint, before any row: the model listing must name the configured model,
-and a canary request must come back sound. An API that lists no models, or that lists
-deployment names rather than the name you send, runs with --skip-model-check and is proven
-by the canary alone. Guided, the canary's schema allows one value for one key -- the
-label, or the first key when the prompt has no label -- and the reply must be exactly that
-in the schema's key order, so a server that silently ignores `response_format` is refused. Unguided there is nothing to enforce, so the
-canary only has to parse; a canary that does not parse is a warning, and the breaker that
-refuses an endpoint whose first 20 replies all fail parsing does the rest.
+Preflight, per endpoint, before any row
+    The model listing must name the configured model, and a canary request must come back
+    sound. --skip-model-check is for an API that lists no models, or that lists deployment
+    names rather than the name you send; the canary then proves the endpoint alone.
+
+    Guided, the canary's schema allows one value for one key -- the label, or the first
+    key when the prompt has no label -- and the reply must be exactly that, in the
+    schema's key order. So a server that silently ignores `response_format` is refused
+    before a single row is sent. Unguided there is nothing to enforce: the canary only has
+    to parse, and one that does not is a warning. The breaker that refuses an endpoint
+    whose first 20 replies all fail parsing catches the rest.
 
 Resume
     `<out>/results.jsonl` is append-only, one line per final answer, flushed per line and
-    fsync'd every 50. A restart skips every row already recorded; `--retry-errors` re-sends
-    rows whose latest record is an error or a parse error. The resume key is (item id,
-    model, prompt sha, schema sha or "guided=off"), plus the endpoint in compare mode.
-    The items file's own sha is not part of it, so a pool that grew is judged where it
-    grew: add rows to the file, re-run into the same directory, and only the new ids are
-    sent. Runs made before the items interface keyed on (table sha, arm, row index) and
-    do not resume here; their results.jsonl stays readable.
-    The first real run writes `<out>/run.json`, which pins prompt, schema, sampling, order
-    seed and mode; a restart with any of them changed is refused. `--dry-run` writes no
-    run.json, so one prompt after another can be rendered into the same directory. --max-tokens is the exception: a reply cut off at the
-    budget is recorded as an error and never as a verdict, so raising it and re-running
-    with --retry-errors recovers exactly those rows and costs nothing already judged. Ctrl-C once: stop sending, let in-flight requests
-    finish, write the summary. Twice: exit now (every recorded line is already on disk).
+    fsync'd every 50. A restart skips every row already recorded. `--retry-errors`
+    re-sends the rows whose latest record is an error or a parse error.
 
-Items (`--items`, one JSON object per line)
+    The resume key is (item id, model, prompt sha, schema sha or "guided=off"), plus the
+    endpoint in compare mode. The items file's own sha is not part of it, so a pool that
+    grew is judged where it grew: add rows to the file, re-run into the same directory,
+    and only the new ids are sent.
 
-    {"id": "ctgan_split:41772", "fields": {"age": "[70-80)", "diag_1": "250.83", ...}}
+    The first real run writes `<out>/run.json`, which pins the prompt, schema, sampling,
+    order seed and mode. A restart with any of them changed is refused. --max-tokens is
+    the exception: a reply cut off at the budget is an error and never a verdict, so
+    raising it and re-running with --retry-errors recovers exactly those rows and costs
+    nothing already judged. `--dry-run` writes no run.json, so one prompt after another
+    can be rendered into the same directory.
 
-    id      required, unique. It is the only thing tying a verdict back to a row, and this
-            script never parses it.
-    fields  required. Handed to `prompts/<prompt>/user.md` as `{column}` substitutions; a
-            template naming a field the item lacks is refused before anything is sent.
-    group,  optional, opaque. They only bucket `summary.json`; nothing here reads their
-    stratum meaning. A caller that filters rows with rules puts its own labels here.
-    weight  optional, default 1.0. Used for the weighted rates in the summary, so a caller
-            that sampled strata unequally can still report a population rate.
-
-    Rows are sent in one seeded shuffled order, so any prefix of a run is a random sample
-    of the items file. Nothing else about the items is interpreted: the model never sees
-    the id, the group, or anything but the rendered `fields`.
-
-    Building the items file is the caller's job, deliberately. Stratifying a pool needs to
-    know what a rule decided, and this repository holds no rules.
+    Ctrl-C once: stop sending, let the in-flight requests finish, write the summary.
+    Twice: exit now. Every recorded line is already on disk either way.
 
 Modes
-    shard      one shared queue, every endpoint pulls from it; all must serve one model.
-    compare    every row to every endpoint (e.g. MedGemma vs a general model). With two
-               replicas of one model, `--mode compare --limit 200` is the agreement check.
+    shard     one shared queue, every endpoint pulls from it. All must serve one model.
+    compare   every row to every endpoint, e.g. MedGemma against a general model. With
+              two replicas of one model, `--mode compare --limit 200` is the agreement
+              check.
 
 Endpoints
-    One server needs no files: `--base-url https://host/v1 --model NAME`, with the key in
-    `--api-key` or `LLMJUDGE_API_KEY`. Several, or one with a concurrency window of its
-    own, go in `--endpoints endpoints.toml`, where each entry names the environment
-    variables holding its URL and key; those are read from the endpoint's env file if
-    there is one and from the process environment otherwise.
+    One server needs no files. The key goes in --api-key or LLMJUDGE_API_KEY:
 
-    Request fields differ between APIs. `--drop seed --drop temperature` removes what an
-    API rejects and `--extra '{"max_completion_tokens": 4096}'` adds what it wants, so
-    renaming a field is a drop plus an add. Both show up in `request_example.json` under
-    `--dry-run`, before anything is sent.
+        --base-url https://host/v1 --model NAME
 
-    So does the transport. A base URL that already carries a path is used exactly as given
-    -- Azure's /openai/deployments/<name>?api-version=..., a gateway's prefix -- and only a
-    bare host gets /v1 appended. `--chat-path` moves the request, `--auth-header api-key`
-    puts the key in another header (raw, with no Bearer), `--header 'Name: value'` adds one
-    to every request and an empty value removes one, and `--skip-model-check` is for an API
-    that lists no models. Azure:
+    Several, or one with a concurrency window of its own, go in an endpoints file:
+
+        --endpoints configs/endpoints.toml
+
+    Each entry there names the environment variables holding its URL and key, never the
+    values. Those are read from the endpoint's env file if it has one, and from the
+    process environment otherwise.
+
+    APIs differ in the request fields they accept. `--drop seed` removes one and `--extra
+    '{"max_completion_tokens": 4096}'` adds one, so renaming a field is a drop plus an
+    add. Both show up in `request_example.json` under --dry-run, before anything is sent.
+
+    They differ in transport too. A base URL that already carries a path is used exactly
+    as given -- Azure's /openai/deployments/<name>?api-version=..., a gateway's prefix --
+    and only a bare host gets /v1 appended. `--chat-path` moves the request,
+    `--auth-header api-key` puts the key in another header (raw, with no Bearer),
+    `--header 'Name: value'` adds a header to every request and an empty value removes
+    one, and `--skip-model-check` is for an API that lists no models. Azure needs four of
+    them at once:
 
     python3 -m llmjudge --skip-model-check --auth-header api-key --drop seed \\
         --base-url 'https://R.openai.azure.com/openai/deployments/D?api-version=2024-06-01' \\
@@ -156,15 +163,8 @@ Endpoints
     native /v1/messages, where the system prompt is a top-level field and there is no
     response_format -- needs an adapter, not these flags.
 
-    python3 -m llmjudge --items items.jsonl --out out/c3-pilot --prompt c3 \\
-        --run-tag c3-pilot-01 --dry-run
-    python3 -m llmjudge --items items.jsonl --out out/c3-pilot --prompt c3 \\
-        --run-tag c3-pilot-01
-    nohup python3 -m llmjudge --items items.jsonl --out out/c3r-full --prompt c3-reasoning \\
-        --guided off --run-tag c3r-full-01 >> out/c3r-full.log 2>&1 &
-
-Outputs in `<out>`: order.csv, run.json, results.jsonl,
-summary.json, endpoints.json, prompt_example.txt, request_example.json, judge.pid.
+Outputs in `<out>`: order.csv, run.json, results.jsonl, summary.json, endpoints.json,
+prompt_example.txt, request_example.json, judge.pid.
 Exit codes: 0 every planned row recorded, 2 configuration refused, 3 stopped incomplete.
 """
 
@@ -240,19 +240,14 @@ def file_sha(path: str) -> str:
 
 
 def resolve(path: str) -> str:
-    """Relative paths are relative to the working directory, like every other CLI.
-
-    They used to be relative to the repository root, which is wrong the moment the package
-    is pip-installed: the root is then site-packages, and `--items items.jsonl` looks for
-    the pool inside the installation."""
+    """An absolute path. A relative one is relative to the working directory, like every
+    other CLI -- not to the package, which after a pip install is site-packages."""
     return os.path.abspath(os.path.expanduser(path))
 
 
 def rel(path: str) -> str:
-    """Relative to the working directory when it is below it, absolute otherwise.
-
-    Items and results usually live elsewhere -- on Drive, or on a share -- and
-    `../../../../mnt/...` in run.json helps nobody reading it later."""
+    """A short path for the log and for run.json: relative to the working directory when
+    the path is below it, absolute otherwise. `../../../../mnt/x` helps nobody."""
     r = os.path.relpath(path, os.getcwd())
     return path if r.startswith("..") else r
 
@@ -260,8 +255,10 @@ def rel(path: str) -> str:
 def join(base: str, path: str) -> str:
     """base + path, with any query string kept at the end where it belongs.
 
-    Azure carries `?api-version=...` on the base URL, and appending `/chat/completions`
-    after it would send the path into the query."""
+        join("https://r.openai.azure.com/openai/deployments/d?api-version=2024-06-01",
+             "/chat/completions")
+        -> ".../deployments/d/chat/completions?api-version=2024-06-01"
+    """
     head, sep, query = base.partition("?")
     return head.rstrip("/") + path + sep + query
 
@@ -363,10 +360,9 @@ def example_block(system: str) -> str:
     so nothing about the answer -- its keys, their order, or the values a label may take --
     is written into this repository.
 
-    A prompt often shows the model more than one JSON object: worked examples, a few-shot
-    pair of a good and a bad answer. Those are between the prompt and the model and the
-    judge has no business reading them -- but it cannot tell which object is the contract
-    either, so the prompt says, by fencing that one in ```answer.
+    A prompt may show the model several JSON objects: worked examples, a good answer and
+    a bad one. Those are between the prompt and the model. The judge cannot tell which of
+    them is the contract, so the prompt says which, by fencing it in ```answer.
     """
     lines, blocks, depth, buf, start = system.splitlines(), [], 0, [], 0
     for i, line in enumerate(lines):
@@ -582,20 +578,22 @@ def parse_strict(content: str | None, contract: dict) -> dict:
 def parse_tolerant(content: str | None, contract: dict) -> dict:
     """Without a grammar: the LAST JSON object carrying the label key, and the text before it.
 
-    Scanning for the last such object, rather than the span between the first `{` and the
-    last `}`, tolerates plain-text reasoning and code fences around the answer, the way
-    c1_judge.parse_verdict does. Whatever the model wrote before that object is kept as
-    `reasoning`. MedGemma's `<unused94>thought` span is dropped, so draft JSON inside it
-    cannot win over the answer after it -- unless the span never closes, which is the one
-    case `parse_note` records. Still exactly the keys the prompt asked for and a value it
-    allows, so a reply that misses is a parse error and never a guessed answer.
+    Taking the last such object, rather than everything between the first `{` and the
+    last `}`, tolerates plain-text reasoning and code fences around the answer. Whatever
+    the model wrote before it is kept as `reasoning`.
+
+    MedGemma's `<unused94>thought` span is dropped first, so draft JSON inside it cannot
+    beat the answer that follows. A span that never closes is the exception, and
+    `parse_note` records it.
+
+    The keys and the label value are checked as strictly as on the guided path: a reply
+    that misses either is a parse error, never a guessed answer.
     """
     raw = content or ""
     body, note = THOUGHT.sub("", raw), None
     if raw.rfind("<unused94>") > raw.rfind("<unused95>"):
-        # A thought span that never closes runs to the end of the text, so THOUGHT strips
-        # the answer with it. Scan the whole reply instead, markers removed. This happened
-        # on 58 of 121 replies in runs/c1/ngrok-27b-c1r-stream.
+        # An unclosed thought span runs to the end of the reply, so THOUGHT would strip
+        # the answer along with it. Scan the whole reply instead, markers removed.
         body = raw.replace("<unused94>", "").replace("<unused95>", "")
         note = "json inside unclosed thought"
     label = contract["label"]
@@ -621,7 +619,7 @@ def parse_tolerant(content: str | None, contract: dict) -> dict:
 
 def build_payload(model: str, prompt: dict, user_text: str, decoding: dict,
                   extra: dict | None = None, schema: dict | None = None,
-                  name: str = "c2_verdict", guided: bool = True,
+                  name: str = "verdict", guided: bool = True,
                   drop: list[str] | None = None, stream: bool = False) -> dict:
     """The request body. `extra` adds or overrides fields, `drop` removes them, and a
     field set to null is removed too.
@@ -731,11 +729,10 @@ def row_key(item_id: str, model: str, prompt: dict,
             endpoint: str = "", guided: bool = True) -> str:
     """What resume is keyed on. Changing any part of it means a row is sent again.
 
-    The items file's sha is deliberately not in here. A pool grows: someone generates
-    another 200 rows and adds them to the file. Keying on the file meant every row
-    already judged was judged again, which for a 50,000-row pool is a day of GPU time to
-    re-learn what is already on disk. The id is unique within the file and the prompt,
-    model and schema are pinned separately, so the file's identity adds nothing.
+    The items file's sha is deliberately not in here. Pools grow: add 200 rows to the
+    file, re-run, and only those 200 should be sent. Keying on the file would re-judge
+    every row already on disk. The id is unique within the file, and the prompt, model
+    and schema are pinned separately, so the file's identity adds nothing.
     """
     return sha("|".join([item_id, model, prompt["prompt_sha"],
                          prompt["schema_sha"] if guided else "guided=off", endpoint]))[:32]
@@ -759,9 +756,8 @@ def read_results(path: str) -> tuple[dict[str, dict], int, int]:
                 rec = json.loads(line)
                 key = rec["key"]
             except (ValueError, TypeError, KeyError):
-                # Torn by a hard kill, edited by hand, or written by a judge older than
-                # the items interface. Skipping it costs one row; raising here killed the
-                # whole run before it had sent anything.
+                # Torn by a hard kill, or edited by hand. Skipping it costs one row;
+                # raising here would cost the whole run before it sent anything.
                 bad += 1
                 continue
             latest[key] = rec
@@ -1002,9 +998,9 @@ class Endpoint:
         itself (`--base-url`, `--api-key`), then the env file, then the process
         environment.
 
-        The env file does not have to exist. A Colab cell that ran `serve_vllm.py` already
-        has the URL and the key in `os.environ`, and a vendor API usually has its key
-        there too, so demanding a `.env` on disk only made people write one."""
+        The env file does not have to exist. A Colab cell that ran `serve_vllm.py` has
+        the URL and the key in `os.environ` already, and a vendor API usually has its key
+        there too."""
         env_file = resolve(self.cfg.get("env_file", ".env"))
         env = read_env(env_file) if os.path.isfile(env_file) else {}
         where = f"the endpoints file, {rel(env_file)} or the environment"
@@ -1015,10 +1011,9 @@ class Endpoint:
                               f"in none of {where}")
         url = (url if "://" in url else "https://" + url).rstrip("/")
         parts = urllib.parse.urlsplit(url)
-        # A URL that already carries a path of its own is used exactly as it was given:
-        # Azure's /openai/deployments/<name>, Gemini's /v1beta/openai, a gateway's prefix.
-        # Only a bare host gets /v1 appended, which is what every vLLM URL looked like
-        # before, so nothing that worked stops working.
+        # A URL that already carries a path is used exactly as given: Azure's
+        # /openai/deployments/<name>, Gemini's /v1beta/openai, a gateway's prefix. Only
+        # a bare host gets /v1 appended.
         api = url if parts.path.strip("/") else join(url, "/v1")
         root = f"{parts.scheme}://{parts.netloc}"        # vLLM serves /metrics at the root
         headers = dict(HEADERS)
@@ -1409,9 +1404,9 @@ class Run:
             kind, r = await ep.call("POST", ep.chat_path, body, self.args.timeout,
                                     stream=ep.stream)
         except Exception as e:
-            # Rendering and serialising happen here, so a bug in either used to kill the
-            # task before the in-flight slot was returned: remaining() then never reached
-            # zero and the run hung with rows left. Record the row and move on instead.
+            # Rendering and serialising happen here. A bug in either must not kill the
+            # task before the in-flight slot is returned, or remaining() never reaches
+            # zero and the run hangs with rows left. Record the row and move on.
             self.record(ep, it, None, {"latency_s": round(time.monotonic() - t0, 3)},
                         error=("internal", f"{type(e).__name__}: {str(e)[:200]}"))
             ep.errors["internal"] += 1
@@ -1660,11 +1655,11 @@ class Run:
 def run_async(coro):
     """asyncio.run, except in a notebook cell, where there is already a loop running.
 
-    Jupyter and Colab execute a cell inside their own event loop, so `asyncio.run` there
-    raises "cannot be called from a running event loop" and the whole notebook entry
-    point was unusable. A worker thread gets its own loop and the cell blocks on the
-    join, which is what a cell should do anyway. The signal handlers are already skipped
-    off the main thread, so Ctrl-C there is the kernel's interrupt, not a drain.
+    Jupyter and Colab run a cell inside their own event loop, where `asyncio.run` raises
+    "cannot be called from a running event loop". A worker thread gets a loop of its own
+    and the cell blocks on the join, which is what a cell should do anyway. Signal
+    handlers are skipped off the main thread, so Ctrl-C there is the kernel's interrupt
+    rather than a drain.
     """
     try:
         asyncio.get_running_loop()
@@ -1926,8 +1921,8 @@ def run_main(args: argparse.Namespace) -> int:
             "prompt_dir": rel(prompt["dir"]) if prompt["dir"] else None,
             "prompt_sha": prompt["prompt_sha"], "key_order": list(prompt["order"]),
             "guided": guided,
-            # Unguided nothing is sent, but the sha still pins the key order the prompt asks
-            # for, and it keeps the resume key the same as c2_judge's on the guided path.
+            # Unguided nothing is sent, but the sha still pins the key order the prompt
+            # asks for, so it stays part of the resume key.
             "schema": prompt["schema"] if guided else None,
             "schema_sha": prompt["schema_sha"],
             "label": prompt["label"], "values": prompt["values"],
@@ -1966,11 +1961,10 @@ def run_main(args: argparse.Namespace) -> int:
                              user_text, decoding, args.extra, guided=guided,
                              drop=args.drop, stream=args.stream))
     if args.dry_run:
-        # run.json is deliberately not written. It pins the prompt and the decoding for
-        # every later session, and a dry run sends nothing and records nothing, so there
-        # is no results.jsonl for it to protect yet. Written here, it locked the directory
-        # to the prompt you were only trying out: the second --dry-run with a different
-        # prompt was refused and you had to delete the directory to look at another one.
+        # No run.json here. It pins the prompt and the decoding for every later session,
+        # and a dry run sends nothing, so there is no results.jsonl for it to protect.
+        # Writing it would lock the directory to a prompt you were only trying out, and
+        # the next --dry-run with a different prompt would be refused.
         log(f"dry run: no calls, and no run.json. Wrote order.csv, prompt_example.txt, "
             f"request_example.json in {rel(out)}")
         return EXIT_OK
