@@ -59,18 +59,30 @@ A Colab runtime is temporary; Drive is not. `llmjudge.colab.run()` runs the judg
 results up to Drive every 100 s and once more at the end. Appending straight to the Drive
 FUSE mount is not reliable, which is why the results are not simply written there.
 
-Cell 1 is `notebooks/serve_vllm.py`, which starts the server. Cell 2 is this:
+**Open `notebooks/run_judge.ipynb` in Colab.** It installs this package from GitHub,
+mounts Drive, reports the pool, starts the server, judges, and prints the summary. Set the
+GPU (Runtime → Change runtime type → A100 or L4) and run the cells top to bottom.
 
-```python
-!pip -q install "git+https://{userdata.get('GH_TOKEN')}@github.com/<org>/llmjudge.git@v0.1.0"
+**Code comes from git; Drive holds only data.** The items file goes in, the results come
+out, and nothing else is ever uploaded. One items file, once:
 
-from llmjudge.colab import run
-run(items="drive:genmd-judge/items.jsonl",
-    out="drive:genmd-judge/results/pilot",
-    run_tag="pilot-01", prompt="c3", limit=100)
+```bash
+llmjudge make-items --spec configs/pool.diabetes130.toml --pool pilot \
+    --root ../judge-0 --out ~/drive/items-pilot.jsonl
 ```
 
-Nothing else is pasted. `drive:` is `MyDrive/`, and the serving cell exports
+Upload that to `MyDrive/genmd-judge/` at drive.google.com — 114 KB for the pilot.
+
+Two Colab Secrets (key icon in the sidebar, then toggle notebook access): `GH_TOKEN`, a
+fine-grained PAT with **Contents: Read-only** scoped to this one repo, and `HF_TOKEN` for
+the MedGemma weights. Neither is typed into a cell, so a shared `.ipynb` carries no
+credential, and a leaked cell output cannot push, cannot reach another repo, and expires.
+
+`notebooks/run_judge.ipynb` pins `TAG`, so a run six months from now installs the same
+code. `serve_vllm.py` ships inside the package, which is why the notebook can `%run` it
+after a `pip install` with no checkout.
+
+`drive:` is `MyDrive/`, and the serving cell exports
 `LLMJUDGE_BASE_URL`, `LLMJUDGE_API_KEY` and `LLMJUDGE_MODEL`, so the judge finds the
 server by itself; that URL is `127.0.0.1`, not the tunnel, so no Cloudflare 524 can cut a
 slow reply and the timeout defaults to 600 s instead of 95. Every other option is
@@ -78,8 +90,7 @@ slow reply and the timeout defaults to 600 s instead of 95. Every other option i
 
 **Re-running the cell resumes.** Whatever the last session left on Drive is copied back
 down first, so a recycled runtime costs only the requests that were in flight. There are
-no bundles and no zips: the items file is the only thing a colleague puts on Drive, and
-the code comes from a tag.
+no bundles and no zips.
 
 **The mirror is verified, not assumed.** A copy that fails mid-run prints its error and
 carries on, which is right while there is still time to recover. At exit the line counts
@@ -316,6 +327,8 @@ llmjudge/
 │   ├── run.py        the judge: endpoint pool, retries, breakers, resume, summary
 │   ├── items.py      make-items: CSVs + a pool spec -> items.jsonl
 │   ├── colab.py      the Colab cell: Drive in, Drive out, mirror verified at exit
+│   ├── serve_vllm.py serves MedGemma behind a Cloudflare tunnel; ships with the package
+│                     so the notebook can %run it with no checkout
 │   ├── template.py   {column} substitution, and the refusal when a column is missing
 │   ├── prompts/<name>/  system.md + user.md — c1, c1r, c2, c2-reason-first, c3,
 │   │                 c3-reasoning, c3-reasoning-2. Inside the package so that pip
@@ -324,7 +337,7 @@ llmjudge/
 ├── configs/endpoints.example.toml     names of env keys, never values
 ├── configs/pool.diabetes130.toml      a worked pool spec, as an example of the shape
 ├── notebooks/
-│   ├── serve_vllm.py    the Colab cell that serves MedGemma behind a Cloudflare tunnel
+│   └── run_judge.ipynb  the notebook: install, Drive, pool, serve, judge, summary
 │   └── judge_local.py   a second, incompatible judge — see "What is still to do"
 └── tests/            mock_vllm.py + test_run.py against a threaded fake server,
                       test_colab.py against a Drive that is a temporary directory,
@@ -394,7 +407,7 @@ Never in the source, never in a notebook body.
 | one server, anywhere | `LLMJUDGE_API_KEY` in the environment, read when `--api-key` is not given |
 | your machine | `.env`, gitignored; the endpoints file names the key, not its value |
 | Colab | **Colab Secrets** (key icon in the sidebar), read with `userdata.get` |
-| the served endpoint's own key | generated fresh per session by `notebooks/serve_vllm.py` |
+| the served endpoint's own key | generated fresh per session by `llmjudge/serve_vllm.py` |
 
 The vLLM API key is no longer a constant. The tunnel hostname is random per session
 anyway, so a fixed key bought nothing and could only leak.
@@ -407,9 +420,9 @@ The extraction, the items interface and the pool builder are done; see
 1. **One provider shape.** The request body is OpenAI chat-completions, always, so
    `--chat-path` cannot actually reach Anthropic or OpenAI's `/responses`. A `providers.py`
    adds the second shape.
-2. **There is no ready-made judging notebook.** `llmjudge/colab.py` is there and the cell
-   is four lines (see "Colab" above), but `notebooks/run_judge.ipynb` — the file a
-   colleague opens rather than types — is not written yet.
+2. **The repo is not pushed yet.** `notebooks/run_judge.ipynb` installs
+   `git+https://…@github.com/{REPO}.git@{TAG}`, so it needs the remote added, `main`
+   pushed, `v0.1.0` tagged, and `REPO` set in the notebook's first cell.
 3. **`notebooks/judge_local.py` is a second, incompatible judge** and is described above as
    a reference loop, which it is not. Delete it or rewrite it.
 

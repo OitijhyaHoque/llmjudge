@@ -24,4 +24,4 @@ llmjudge = "llmjudge.run:main"
 packages = ["llmjudge"]
 
 [tool.setuptools.package-data]
-llmjudge = ["prompts/*/*.md"]
+llmjudge = ["prompts/*/*.md", "serve_vllm.py"]

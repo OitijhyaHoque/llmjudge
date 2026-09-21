@@ -36,7 +36,7 @@ MYDRIVE = os.path.join(DRIVE_ROOT, "MyDrive")
 LOCAL_ROOT = "/content"
 BACKUP_EVERY = 100                     # seconds between copies to Drive
 
-# Where the model is, in the order the names are looked at. `notebooks/serve_vllm.py`
+# Where the model is, in the order the names are looked at. `llmjudge/serve_vllm.py`
 # exports the LLMJUDGE_* names, so a cell that has just started a server needs to say
 # nothing at all. The MEDGEMMA_* names are what the older notebooks exported and they
 # still work.
