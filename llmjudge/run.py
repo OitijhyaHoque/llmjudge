@@ -5,8 +5,9 @@ Built from `scripts/c2_judge.py`; the pool, the endpoint pool, resume and the fa
 handling are unchanged. What is new is `--guided off`, for prompts that reason in plain text
 before they answer (`prompts/c3-reasoning`), which no JSON schema can hold.
 
-    --guided on    the default. `response_format` carries the two-key schema and the reply
-                   must be exactly that object, in the schema's key order. This is c2_judge's
+    --guided on    the default. `response_format` carries the schema read from the
+                   prompt's JSON example, and the reply must be exactly that object, in
+                   the example's key order. This is c2_judge's
                    behaviour, down to the resume keys, so a c2 run resumes under this script.
     --guided off   no `response_format` at all. The reply may carry reasoning in plain text;
                    the verdict is the LAST JSON object with a `verdict` key, so prose and code
@@ -150,8 +151,6 @@ PROMPTS = os.path.join(HERE, "prompts")        # ships with the package, so pip 
 
 from .template import PLACEHOLDER, render_user
 
-VERDICTS = ("consistent", "inconsistent", "unsure")
-KEYS = ("verdict", "short_reason")
 CANARY = "canary-ok"
 HEADERS = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
 NGROK_CODE = re.compile(r"ERR_NGROK_\d+")
@@ -257,10 +256,11 @@ def build_prompt(name: str, system: str, user: str, directory: str | None = None
     system, user = system.strip(), user.strip()
     if not system or not user:
         raise ConfigError(f"prompt {name!r}: the system and user prompts cannot be empty")
-    order = key_order(system)
-    schema = build_schema(order)
+    contract = read_contract(system)
+    schema = contract["schema"]
     return {"name": name, "dir": directory, "system": system, "user": user,
-            "order": order, "schema": schema,
+            "contract": contract, "order": contract["order"], "schema": schema,
+            "label": contract["label"], "values": contract["values"],
             "prompt_sha": sha(system + "\0" + user),
             "schema_sha": sha(json.dumps(schema, separators=(",", ":")))}
 
@@ -286,36 +286,191 @@ def load_prompt(arg: str) -> dict:
     return build_prompt(os.path.basename(d.rstrip(os.sep)), system, user, d)
 
 
-def key_order(system: str) -> tuple[str, ...]:
-    """The output key order the prompt asks for, which becomes the schema's order.
+def example_block(system: str) -> str:
+    """The prompt's one JSON example: a line that starts with `{`, up to its closing brace.
 
-    Under guided decoding keys are generated in schema order, so a reason-first prompt
-    with a verdict-first schema would silently be the no-reasoning arm. The order is read
-    from the prompt's one JSON example line, and a `write "X" FIRST` instruction that
-    disagrees with it is refused.
+    This is the contract. Whatever shape the example shows is the shape the judge demands,
+    so nothing about the answer -- its keys, their order, or the values a label may take --
+    is written into this repository.
     """
-    examples = [ln for ln in system.splitlines()
-                if ln.lstrip().startswith("{") and all(f'"{k}"' in ln for k in KEYS)]
-    if len(examples) != 1:
-        raise ConfigError(f"expected one JSON example line with keys {KEYS} in the system "
-                          f"prompt, found {len(examples)}")
-    order = tuple(sorted(KEYS, key=lambda k: examples[0].index(f'"{k}"')))
+    lines, blocks, depth, buf = system.splitlines(), [], 0, []
+    for line in lines:
+        if depth == 0 and not line.lstrip().startswith("{"):
+            continue
+        buf.append(line)
+        depth += braces(line)
+        if depth <= 0:
+            blocks.append("\n".join(buf))
+            depth, buf = 0, []
+    if len(blocks) != 1:
+        raise ConfigError(f"the system prompt must show exactly one JSON example of the "
+                          f"answer, on its own line(s) starting with '{{'; found "
+                          f"{len(blocks)}")
+    return blocks[0]
+
+
+def braces(line: str) -> int:
+    """Net `{` minus `}` outside string literals."""
+    depth, quoted, escaped = 0, False, False
+    for ch in line:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif not quoted:
+            depth += (ch == "{") - (ch == "}")
+    return depth
+
+
+BARE = re.compile(r'(?<!["\w])<[^>]*>(?!")')
+
+
+def fold_alternatives(text: str) -> str:
+    """`"a" | "b" | "c"` -> `{"|": ["a", "b", "c"]}`, so the example becomes valid JSON.
+
+    A scanner rather than a regex, because the alternatives may be strings holding commas,
+    braces or a `|` of their own."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] == '"':
+            j = skip_string(text, i)
+            out.append(text[i:j])
+            i = j
+        elif text[i] != ":":
+            out.append(text[i])
+            i += 1
+        else:
+            j, depth, cuts = i + 1, 0, []
+            while j < n:
+                c = text[j]
+                if c == '"':
+                    j = skip_string(text, j)
+                    continue
+                if c in "{[":
+                    depth += 1
+                elif c in "}]":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif depth == 0 and c == ",":
+                    break
+                elif depth == 0 and c == "|":
+                    cuts.append(j)
+                j += 1
+            value = text[i + 1:j]
+            if cuts:
+                parts = []
+                for a, b in zip([i] + cuts, cuts + [j]):
+                    parts.append(text[a + 1:b].strip())
+                out.append(': {"|": [' + ", ".join(parts) + "]}")
+            else:
+                out.append(":" + fold_alternatives(value))   # an object or array nests
+            i = j
+    return "".join(out)
+
+
+def skip_string(text: str, i: int) -> int:
+    """-> the index just past the string literal starting at `text[i] == '\"'`."""
+    j = i + 1
+    while j < len(text) and text[j] != '"':
+        j += 2 if text[j] == "\\" else 1
+    return j + 1
+
+
+def example_to_json(block: str):
+    """The example is not valid JSON -- it carries `"a" | "b"` alternatives and `<...>`
+    placeholders. Fold both into JSON, so the shape can be read with json.loads instead of
+    a hand-written parser."""
+    text = fold_alternatives(BARE.sub(lambda m: json.dumps(m.group(0)), block))
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        raise ConfigError(f"the JSON example in the system prompt cannot be read ({e}). "
+                          f"Values may be literals, <placeholders>, or alternatives "
+                          f'written "a" | "b" | "c".\n{block}') from e
+
+
+def schema_of(node) -> dict:
+    """A JSON Schema for one node of the example. Nothing here is judge-specific."""
+    if isinstance(node, dict) and set(node) == {"|"}:
+        values = node["|"]
+        if all(isinstance(v, str) and v.startswith("<") for v in values):
+            return {"type": "string"}
+        kinds = {"string" if isinstance(v, str) else
+                 "boolean" if isinstance(v, bool) else "number" for v in values}
+        return {"type": kinds.pop() if len(kinds) == 1 else "string", "enum": values}
+    if isinstance(node, dict):
+        return {"type": "object",
+                "properties": {k: schema_of(v) for k, v in node.items()},
+                "required": list(node), "additionalProperties": False}
+    if isinstance(node, list):
+        if not node:
+            raise ConfigError("an empty array in the JSON example says nothing about the "
+                              "answer; show one element")
+        return {"type": "array", "items": schema_of(node[0])}
+    if isinstance(node, bool):
+        return {"type": "boolean"}
+    if isinstance(node, (int, float)):
+        return {"type": "number"}
+    return {"type": "string"}
+
+
+def read_contract(system: str) -> dict:
+    """-> {order, schema, label, values}: what the prompt asks the model to answer.
+
+    `label` is the first key whose example lists alternatives -- the categorical answer
+    the summary counts and the canary pins. `verdict` in the prompts that ship here,
+    `score` or `category` in yours; the name is the prompt's business, not this repo's.
+    """
+    example = example_to_json(example_block(system))
+    if not isinstance(example, dict):
+        raise ConfigError("the JSON example must be an object, not a "
+                          f"{type(example).__name__}")
+    schema = schema_of(example)
+    order = tuple(example)
+    labels = [k for k in order if "enum" in schema["properties"][k]]
+    if not labels:
+        raise ConfigError("one key of the answer must list the values it may take, as "
+                          '"verdict": "consistent" | "inconsistent" | "unsure". That key '
+                          "is what the summary counts and what the canary pins.")
     first = FIRST.findall(system)
     if first and first[-1] != order[0]:
         raise ConfigError(f'the prompt says write "{first[-1]}" FIRST but its JSON example '
                           f'starts with "{order[0]}"')
-    return order
+    return {"order": order, "schema": schema, "label": labels[0],
+            "values": schema["properties"][labels[0]]["enum"]}
 
 
-def build_schema(order: tuple[str, ...], verdicts: tuple[str, ...] = VERDICTS) -> dict:
-    props = {"verdict": {"type": "string", "enum": list(verdicts)},
-             "short_reason": {"type": "string"}}
-    return {"type": "object", "properties": {k: props[k] for k in order},
-            "required": list(order), "additionalProperties": False}
+def canary_schema(contract: dict) -> dict:
+    """The contract's schema with the label pinned to one value, so a server that ignores
+    `response_format` cannot produce it by accident."""
+    schema = json.loads(json.dumps(contract["schema"]))
+    schema["properties"][contract["label"]] = {"type": "string", "enum": [CANARY]}
+    return schema
 
 
-def parse_strict(content: str | None, order: tuple[str, ...]) -> dict:
-    """json.loads, exactly the two keys, a valid verdict. No fallbacks: with a schema, a
+def check_answer(obj, contract: dict) -> dict:
+    """Shared by both parsers: the top-level keys the prompt asked for, and a label the
+    prompt allows. Depth below that is the schema's job under guided decoding, and not
+    worth guessing at without one."""
+    label = contract["label"]
+    if set(obj) != set(contract["order"]):
+        return {"parse_error": f"keys {sorted(obj)}"}
+    value = obj[label]
+    if isinstance(value, str):
+        value = value.strip().lower() if isinstance(contract["values"][0], str) else value
+    if value not in contract["values"]:
+        return {"parse_error": f"{label} {obj[label]!r}"}
+    return {"verdict": value, "answer": obj,
+            "short_reason": obj.get("short_reason") if isinstance(
+                obj.get("short_reason"), str) else None,
+            "key_order_ok": tuple(obj) == contract["order"]}
+
+
+def parse_strict(content: str | None, contract: dict) -> dict:
+    """json.loads, exactly the keys the prompt asked for. No fallbacks: with a schema, a
     reply that needs one means the server is not enforcing it."""
     try:
         obj = json.loads(content or "")
@@ -323,27 +478,19 @@ def parse_strict(content: str | None, order: tuple[str, ...]) -> dict:
         return {"parse_error": f"not JSON: {str(e)[:80]}"}
     if not isinstance(obj, dict):
         return {"parse_error": f"JSON {type(obj).__name__}, not an object"}
-    if set(obj) != set(KEYS):
-        return {"parse_error": f"keys {sorted(obj)}"}
-    if obj["verdict"] not in VERDICTS:
-        return {"parse_error": f"verdict {obj['verdict']!r}"}
-    if not isinstance(obj["short_reason"], str):
-        return {"parse_error": "short_reason is not a string"}
-    return {"verdict": obj["verdict"], "short_reason": obj["short_reason"],
-            "key_order_ok": tuple(obj) == tuple(order)}
+    return check_answer(obj, contract)
 
 
-def parse_tolerant(content: str | None, order: tuple[str, ...]) -> dict:
-    """Without a grammar: the LAST JSON object carrying a `verdict`, and the text before it.
+def parse_tolerant(content: str | None, contract: dict) -> dict:
+    """Without a grammar: the LAST JSON object carrying the label key, and the text before it.
 
     Scanning for the last such object, rather than the span between the first `{` and the
     last `}`, tolerates plain-text reasoning and code fences around the answer, the way
     c1_judge.parse_verdict does. Whatever the model wrote before that object is kept as
     `reasoning`. MedGemma's `<unused94>thought` span is dropped, so draft JSON inside it
     cannot win over the answer after it -- unless the span never closes, which is the one
-    case `parse_note` records. Still exactly the two keys and a valid verdict: this is the reply the prompt
-    asks for, only without a grammar to guarantee it, so a reply that misses is a parse error
-    and never a guessed verdict.
+    case `parse_note` records. Still exactly the keys the prompt asked for and a value it
+    allows, so a reply that misses is a parse error and never a guessed answer.
     """
     raw = content or ""
     body, note = THOUGHT.sub("", raw), None
@@ -359,22 +506,14 @@ def parse_tolerant(content: str | None, order: tuple[str, ...]) -> dict:
             obj, _ = decoder.raw_decode(body, m.start())
         except ValueError:
             continue
-        if isinstance(obj, dict) and "verdict" in obj:
+        if isinstance(obj, dict) and contract["label"] in obj:
             found, at = obj, m.start()
     if found is None:
-        return {"parse_error": f"no JSON object with a verdict: {body.strip()[:80]!r}"}
-    if set(found) != set(KEYS):
-        return {"parse_error": f"keys {sorted(found)}"}
-    verdict = found["verdict"]
-    if isinstance(verdict, str):
-        verdict = verdict.strip().lower()
-    if verdict not in VERDICTS:
-        return {"parse_error": f"verdict {found['verdict']!r}"}
-    if not isinstance(found["short_reason"], str):
-        return {"parse_error": "short_reason is not a string"}
-    return {"verdict": verdict, "short_reason": found["short_reason"],
-            "reasoning": body[:at].strip() or None, "parse_note": note,
-            "key_order_ok": tuple(found) == tuple(order)}
+        return {"parse_error": f"no JSON object with a {contract['label']}: "
+                               f"{body.strip()[:80]!r}"}
+    parsed = check_answer(found, contract)
+    parsed.update(reasoning=body[:at].strip() or None, parse_note=note)
+    return parsed
 
 
 def build_payload(model: str, prompt: dict, user_text: str, decoding: dict,
@@ -525,7 +664,10 @@ def check_run_json(out: str, meta: dict, session: dict) -> None:
 def summarise(results_path: str, meta: dict) -> dict:
     latest, lines, bad = read_results(results_path)
     recs = list(latest.values())
+    label = meta.get("label", "verdict")
+    values = meta.get("values") or sorted({r["verdict"] for r in recs if r.get("verdict")})
     out: dict = {"prompt": meta["prompt"], "items": meta.get("items"), "mode": meta["mode"],
+                 "label": label, "values": values,
                  "rows": len(recs), "lines": lines, "unreadable_lines": bad,
                  "parse_errors": sum(bool(r.get("parse_error")) for r in recs),
                  "errors": dict(collections.Counter(
@@ -541,8 +683,8 @@ def summarise(results_path: str, meta: dict) -> dict:
         judged = [r for r in rs if r.get("verdict")]
         wsum = sum(r.get("weight") or 1.0 for r in judged) or 1.0
 
-        def share(verdicts, weighted):
-            hit = [r for r in judged if r["verdict"] in verdicts]
+        def share(wanted, weighted):
+            hit = [r for r in judged if r["verdict"] in wanted]
             if weighted:
                 return round(sum(r.get("weight") or 1.0 for r in hit) / wsum, 4)
             return round(len(hit) / max(1, len(judged)), 4)
@@ -551,9 +693,9 @@ def summarise(results_path: str, meta: dict) -> dict:
             "rows": len(rs), "judged": len(judged),
             "verdicts": dict(collections.Counter(r["verdict"] for r in judged)),
             "not_judged": len(rs) - len(judged),
-            "inconsistent_rate": share({"inconsistent"}, False),
-            "inconsistent_or_unsure_rate": share({"inconsistent", "unsure"}, False),
-            "inconsistent_rate_weighted": share({"inconsistent"}, True),
+            # One share per value the prompt allows, whatever they are called.
+            "rates": {str(v): share({v}, False) for v in values},
+            "rates_weighted": {str(v): share({v}, True) for v in values},
             "by_stratum": {s: dict(collections.Counter(r.get("verdict") or "not_judged"
                                                        for r in rs if r.get("stratum", "") == s))
                            for s in sorted({r.get("stratum", "") for r in rs})},
@@ -851,11 +993,12 @@ class Endpoint:
             return self.refuse(f"model {self.model!r} is not served; server has {self.served}")
 
         run = self.run
-        order = run.prompt["order"]
+        contract = run.prompt["contract"]
+        order, label = contract["order"], contract["label"]
         payload = build_payload(
             self.model, run.prompt, run.render(run.canary_item), run.decoding, self.extra,
-            schema=build_schema(order, (CANARY,)) if run.guided else None,
-            name="c2_canary", guided=run.guided)
+            schema=canary_schema(contract) if run.guided else None,
+            name="canary", guided=run.guided)
         kind, r = await self.call("POST", "/chat/completions", json.dumps(payload).encode(),
                                   run.args.timeout)
         if kind == "auth":
@@ -885,16 +1028,16 @@ class Endpoint:
             except ValueError:
                 return self.refuse(f"canary reply is not JSON, so response_format is not "
                                    f"enforced: {content[:120]!r}")
-            if not isinstance(obj, dict) or obj.get("verdict") != CANARY:
-                return self.refuse(f"server ignores response_format: canary verdict "
-                                   f"{obj.get('verdict') if isinstance(obj, dict) else obj!r}")
+            if not isinstance(obj, dict) or obj.get(label) != CANARY:
+                return self.refuse(f"server ignores response_format: canary {label} "
+                                   f"{obj.get(label) if isinstance(obj, dict) else obj!r}")
             if tuple(obj) != tuple(order):
                 return self.refuse(f"server does not enforce key order: got {list(obj)}, "
                                    f"schema {list(order)}")
         else:
             # Nothing to enforce, and one row is too little to judge a model on, so a canary
             # that does not parse is a warning; the parse-error breaker in handle() decides.
-            parsed = parse_tolerant(content, order)
+            parsed = parse_tolerant(content, contract)
             self.canary["parsed"] = {k: v for k, v in parsed.items() if k != "reasoning"}
             if parsed.get("parse_error"):
                 self.event(f"WARNING unguided canary did not parse ({parsed['parse_error']}); "
@@ -1036,6 +1179,7 @@ class Run:
             "guided": self.guided,
             "decoding": self.decoding, "extra": ep.extra or None,
             "items_sha": self.meta["items_sha"],
+            "label": self.prompt["label"], "answer": parsed.get("answer"),
             "verdict": parsed.get("verdict"), "short_reason": parsed.get("short_reason"),
             "reasoning": parsed.get("reasoning"), "parse_note": parsed.get("parse_note"),
             "key_order_ok": parsed.get("key_order_ok"),
@@ -1104,7 +1248,7 @@ class Run:
                                                  f"{self.decoding['max_tokens']}"))
                     return
                 parse = parse_strict if self.guided else parse_tolerant
-                parsed = parse(content, self.prompt["order"])
+                parsed = parse(content, self.prompt["contract"])
                 if parsed.get("parse_error"):
                     ep.errors["parse"] += 1
                     if it.parse_retries < 1:
@@ -1372,7 +1516,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--retry-errors", action="store_true",
                     help="re-send rows whose latest record is an error or parse error")
     ap.add_argument("--guided", choices=["on", "off"], default="on",
-                    help="on: response_format carries the two-key schema and the reply must be "
+                    help="on: response_format carries the schema read from the prompt and the reply must be "
                          "exactly that object. off: no schema, so the prompt may reason in "
                          "plain text and the last JSON object with a verdict is taken")
     ap.add_argument("--temperature", type=float, default=0.0)
@@ -1472,6 +1616,7 @@ def run_main(args: argparse.Namespace) -> int:
             # for, and it keeps the resume key the same as c2_judge's on the guided path.
             "schema": prompt["schema"] if guided else None,
             "schema_sha": prompt["schema_sha"],
+            "label": prompt["label"], "values": prompt["values"],
             "decoding": decoding, "order_seed": args.seed, "order_sha": sha(order_csv),
             "items": rel(items_path), "items_sha": items_sha, "items_rows": len(items),
             "mode": args.mode}
@@ -1489,7 +1634,8 @@ def run_main(args: argparse.Namespace) -> int:
     log(f"items {rel(items_path)}: {len(items):,} rows -> {rel(order_path)}")
     for (g, st), c in sorted(counts.items()):
         log(f"  {g or '-':<9} {st or '-':<28} {c:>6}")
-    log(f"prompt {prompt['name']}: key order {list(prompt['order'])}, guided decoding "
+    log(f"prompt {prompt['name']}: answers {list(prompt['order'])}, {prompt['label']} one "
+        f"of {prompt['values']}, guided decoding "
         f"{'on' if guided else 'off'}, max_tokens {args.max_tokens}, prompt sha "
         f"{prompt['prompt_sha'][:16]}, schema sha {prompt['schema_sha'][:16]}")
 

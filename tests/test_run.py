@@ -214,12 +214,12 @@ def read_lines(path: str) -> list[dict]:
 
 
 class ParserTests(unittest.TestCase):
-    ORDER = ("verdict", "short_reason")
+    CONTRACT = cj.load_prompt("c2")["contract"]
 
     def test_valid_reply_and_key_order(self):
-        ok = cj.parse_strict('{"verdict": "unsure", "short_reason": "x"}', self.ORDER)
+        ok = cj.parse_strict('{"verdict": "unsure", "short_reason": "x"}', self.CONTRACT)
         self.assertEqual((ok["verdict"], ok["key_order_ok"]), ("unsure", True))
-        swapped = cj.parse_strict('{"short_reason": "x", "verdict": "unsure"}', self.ORDER)
+        swapped = cj.parse_strict('{"short_reason": "x", "verdict": "unsure"}', self.CONTRACT)
         self.assertFalse(swapped["key_order_ok"])
 
     def test_everything_else_is_a_parse_error(self):
@@ -227,7 +227,33 @@ class ParserTests(unittest.TestCase):
                     '{"verdict": "consistent"}',
                     '{"verdict": "consistent", "short_reason": "x", "reasoning": "y"}',
                     '["consistent"]', 'verdict: consistent', '', None]:
-            self.assertIn("parse_error", cj.parse_strict(bad, self.ORDER), bad)
+            self.assertIn("parse_error", cj.parse_strict(bad, self.CONTRACT), bad)
+
+    def test_a_prompt_with_a_different_answer_shape(self):
+        """Nothing in the judge knows the word "verdict": a scoring prompt works the same."""
+        c = cj.read_contract('Answer:\n{"score": 1 | 2 | 3, "why": "<one sentence>"}')
+        self.assertEqual((c["order"], c["label"], c["values"]),
+                         (("score", "why"), "score", [1, 2, 3]))
+        self.assertEqual(c["schema"]["properties"]["score"],
+                         {"type": "number", "enum": [1, 2, 3]})
+        self.assertEqual(cj.parse_strict('{"score": 2, "why": "late"}', c)["verdict"], 2)
+        self.assertIn("parse_error", cj.parse_strict('{"score": 9, "why": "x"}', c))
+        self.assertIn("parse_error", cj.parse_strict('{"verdict": "consistent"}', c))
+
+    def test_a_nested_answer_shape(self):
+        """c1 answers with an array of findings; that used to be unloadable."""
+        c = cj.load_prompt("c1")["contract"]
+        self.assertEqual((c["order"], c["label"]), (("verdict", "findings"), "verdict"))
+        items = c["schema"]["properties"]["findings"]["items"]
+        self.assertEqual(items["properties"]["category"]["enum"],
+                         ["definition", "clinical", "borderline"])
+        self.assertEqual(items["properties"]["columns"], {"type": "array",
+                                                          "items": {"type": "string"}})
+
+    def test_a_prompt_with_no_choices_is_refused(self):
+        with self.assertRaises(cj.ConfigError) as cm:
+            cj.read_contract('Answer:\n{"why": "<one sentence>"}')
+        self.assertIn("must list the values it may take", str(cm.exception))
 
 
 class PromptTests(unittest.TestCase):

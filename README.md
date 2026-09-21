@@ -1,7 +1,8 @@
 # llmjudge — an LLM judge, and nothing else
 
-This repository sends rows to a model and records verdicts. It holds **no rules, no
-cards, no knowledge tables and no dataset-specific column names**. Those live elsewhere:
+This repository sends rows to a model and records what it answers. It holds **no rules,
+no cards, no knowledge tables, no dataset-specific column names, and no opinion about what
+the model should answer** — the prompt decides that. Those live elsewhere:
 
 ```
 rule-builder/   authors card.json + knowledge/        writes
@@ -79,15 +80,31 @@ a value that names an existing file is read, anything else is the prompt. The te
 copied to `<out>/prompt/`, so a results directory always carries the prompt that produced
 it, and re-running the same cell resumes rather than starts again.
 
-Two rules any prompt has to follow, because they are what makes a reply machine-readable:
+### The answer shape comes from your prompt
 
-- the system prompt contains exactly one JSON example line naming both keys, `verdict`
-  and `short_reason`. Its key order becomes the schema's order, so a prompt that asks the
-  model to reason before answering actually gets to;
-- `verdict` is one of `consistent`, `inconsistent`, `unsure`.
+One rule, and it is the only one: the system prompt shows **one JSON example of the
+answer**, on its own line or lines, starting with `{`. That example *is* the contract —
+the judge reads the keys, their order, and the values each may take out of it, and knows
+nothing else about your answer.
 
-The user template is free: any `{column}` in it is filled from the item's `fields`, and
-every row is checked for every column before the run starts.
+```
+{"score": 1 | 2 | 3 | 4 | 5, "why": "<one sentence>"}
+{"verdict": "consistent" | "inconsistent" | "unsure", "short_reason": "<25 words>"}
+{"verdict": "pass" | "fail", "findings": [{"severity": "high" | "low", "note": "<why>"}]}
+```
+
+- `"a" | "b" | "c"` is a choice, and becomes an enum in the JSON schema sent as
+  `response_format`. Numbers work: `1 | 2 | 3`.
+- `"<anything in angle brackets>"` is free text.
+- Nesting works: objects, and arrays whose one shown element describes the rest.
+- The key order is the schema's order, so a prompt that tells the model to reason before
+  answering actually gets that under guided decoding.
+- **One key must offer a choice.** That key is the label: the thing `summary.json` counts,
+  the agreement check compares in `--mode compare`, and the canary pins when it checks
+  that your server really enforces `response_format`. It can be called anything.
+
+The user template is free too: any `{column}` in it is filled from the item's `fields`,
+and every row is checked for every column before the run starts.
 
 ## The interface
 
@@ -105,9 +122,11 @@ every row is checked for every column before the run starts.
 | `group`, `stratum` | optional | opaque labels that bucket `summary.json`; nothing here reads their meaning |
 | `weight` | optional, 1.0 | for the weighted rates, so a caller that sampled strata unequally can still report a population rate |
 
-**Out** — `<out>/results.jsonl`, append-only, one object per final answer: `id`, `verdict`,
-`short_reason`, `reasoning`, the endpoint and model, the prompt and schema shas, latency and
-token counts, and `error` / `parse_error` where there is one. Errors are recorded, never
+**Out** — `<out>/results.jsonl`, append-only, one object per final answer: `id`, `answer`
+(the model's object, whatever shape your prompt asked for), `verdict` (the label's value,
+under a fixed name so a reader need not know what you called it), `reasoning`, the endpoint
+and model, the prompt and schema shas, latency and token counts, and `error` / `parse_error`
+where there is one. Errors are recorded, never
 dropped, so a re-run retries exactly them.
 
 Building the items file is the caller's job, deliberately: stratifying a pool needs to know
