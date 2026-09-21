@@ -92,15 +92,16 @@ concurrency = 4
 max_concurrency = 8
 # What a run may spend here is capped with --max-requests, on the command line.
 
-# ---- Two ngrok tunnels to a self-hosted box. Disabled; kept as an example of an
-#      endpoint pair that is not Colab.
+# ---- A self-hosted box, reached over a tunnel of your own. Disabled; kept as an
+#      example of a pair of endpoints that is not Colab. A box you own has no
+#      per-request cap, so the window can go much wider than Colab's.
 
 [[endpoint]]
 name = "spark-a"
 enabled = false
 env_file = ".env"
-url_key = "NGROK_URL"
-auth_key = "NGROK_API_KEY"           # bearer token, from .env
+url_key = "SPARK_BASE_URL"
+auth_key = "SPARK_API_KEY"           # bearer token, from .env
 model = "medgemma-27b-it"
 concurrency = 8
 max_concurrency = 128
@@ -109,8 +110,8 @@ max_concurrency = 128
 name = "spark-b"
 enabled = false
 env_file = ".env"
-url_key = "NGROK_URL_2"
-auth_key = "NGROK_API_KEY_2"
+url_key = "SPARK_BASE_URL_2"
+auth_key = "SPARK_API_KEY_2"
 model = "medgemma-27b-it"
 concurrency = 8
 max_concurrency = 128

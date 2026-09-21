@@ -154,8 +154,8 @@ llmjudge --chat-path /responses                 # when it is not /chat/completio
 ```
 
 A key sent through a header other than `Authorization` goes raw, with no `Bearer` — that
-is what Azure wants. `--header` applies on top of every endpoint, so `--header
-'ngrok-skip-browser-warning:'` drops a default the judge would otherwise send.
+is what Azure wants. `--header` applies on top of every endpoint, and an empty value
+removes a header, so `--header 'x-portkey-provider:'` drops one an endpoint entry set.
 
 `--skip-model-check` turns off only the question *is this model served*. The canary still
 has to come back sound, so an endpoint is still proven before a single row is sent.
@@ -367,8 +367,8 @@ as an error and never as a verdict, so no answer on disk was shaped by the old b
 raise it, re-run with `--retry-errors`, and exactly the truncated rows are sent again. Each
 session's budget is kept in `run.json`'s `sessions`.
 
-**Endpoints that come and go.** Connection errors, `ERR_NGROK_*`, 502/503/504 and
-Cloudflare 520–527 pause an endpoint; `/v1/models` and a canary are re-probed with
+**Endpoints that come and go.** Connection errors, 502/503/504 and Cloudflare 520–530
+pause an endpoint; `/v1/models` and a canary are re-probed with
 backoff and it rejoins on its own. Five consecutive timeouts also pause it, because a
 dead engine still answers `/v1/models`. While an endpoint is down its env file is re-read,
 so a Colab restart with a new `trycloudflare` hostname is picked up without stopping the

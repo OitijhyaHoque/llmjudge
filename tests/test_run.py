@@ -645,13 +645,12 @@ class RunTests(RunBase):
 
 
 class ClassifyTests(unittest.TestCase):
-    def test_cloudflare_and_ngrok_statuses(self):
-        self.assertEqual(cj.classify(524, None), "timeout")
+    def test_cloudflare_statuses(self):
+        self.assertEqual(cj.classify(524), "timeout")
         for status in (502, 520, 522, 530):
-            self.assertEqual(cj.classify(status, None), "down", status)
-        self.assertEqual(cj.classify(404, "ERR_NGROK_3200"), "down")
-        self.assertEqual(cj.classify(404, None), "bad_request")
-        self.assertEqual(cj.classify(401, None), "auth")
+            self.assertEqual(cj.classify(status), "down", status)
+        self.assertEqual(cj.classify(404), "bad_request")
+        self.assertEqual(cj.classify(401), "auth")
 
 
 class FlexibilityTests(RunBase):
@@ -767,21 +766,21 @@ class ApiShapeTests(RunBase):
 
     def test_the_chat_path_and_the_key_header_are_the_callers(self):
         """A path of the API's choosing, the key raw in a header of its choosing, a header
-        of your own, and a default header of the judge's dropped."""
+        of your own, and a header dropped again by giving it an empty value."""
         os.environ["LLMJUDGE_API_KEY"] = "sk-test"
         try:
             self.assertEqual(self.cli(
                 "--prompt", "c2", "--base-url", self.url(), "--model", MODEL, "--limit", "2",
                 "--chat-path", "/messages", "--auth-header", "x-api-key",
                 "--header", "anthropic-version: 2023-06-01",
-                "--header", "ngrok-skip-browser-warning:"), cj.EXIT_OK)
+                "--header", "x-goes-away: 1", "--header", "x-goes-away:"), cj.EXIT_OK)
         finally:
             del os.environ["LLMJUDGE_API_KEY"]
         self.assertEqual(self.state.last_path, "/v1/messages")
         self.assertEqual(self.state.last_headers.get("x-api-key"), "sk-test")
         self.assertEqual(self.state.last_headers.get("anthropic-version"), "2023-06-01")
         self.assertIsNone(self.state.last_auth)                       # no Bearer anywhere
-        self.assertNotIn("ngrok-skip-browser-warning", self.state.last_headers)
+        self.assertNotIn("x-goes-away", self.state.last_headers)
 
     def test_an_api_that_lists_no_models_runs_on_the_canary_alone(self):
         self.state.no_models = True

@@ -61,8 +61,8 @@ Throughput
     request through the tunnel.
 
 Failures
-    endpoint down   connection errors, ngrok errors (ERR_NGROK_*), 502/503/504 and
-                    Cloudflare 520-523/525-527/530. The row goes back on the queue and the
+    endpoint down   connection errors, 502/503/504 and Cloudflare 520-523/525-527/530.
+                    The row goes back on the queue and the
                     endpoint pauses. `/v1/models` and a canary are then probed with
                     backoff (--probe-min .. --probe-max) until it comes back on its own.
                     In shard mode the other endpoints drain the queue meanwhile. Five
@@ -199,8 +199,7 @@ from .template import PLACEHOLDER, render_user
 
 CANARY = "canary-ok"
 ANSWER_FENCE = "```answer"          # marks the contract among a prompt's other examples
-HEADERS = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
-NGROK_CODE = re.compile(r"ERR_NGROK_\d+")
+HEADERS = {"Content-Type": "application/json"}
 FIRST = re.compile(r'write "(\w+)" FIRST')
 WAITING = re.compile(r"^vllm:num_requests_waiting(?:\{[^}]*\})?\s+([0-9.eE+-]+)", re.M)
 THOUGHT = re.compile(r"<unused94>.*?(?:<unused95>|$)", re.S)   # MedGemma's thinking span
@@ -937,14 +936,14 @@ class Tuner:
 # endpoint
 
 
-def classify(status: int, ngrok_code: str | None) -> str:
+def classify(status: int) -> str:
     if status in (401, 403):
         return "auth"
     if status == 429:
         return "overload"
     if status == 524:                  # Cloudflare: the origin sent nothing for ~100 s
         return "timeout"
-    if ngrok_code or status in (502, 503, 504, 520, 521, 522, 523, 525, 526, 527, 530):
+    if status in (502, 503, 504, 520, 521, 522, 523, 525, 526, 527, 530):
         return "down"                  # 530 = Cloudflare tunnel not connected
     if status in (400, 404, 405, 413, 422):
         return "bad_request"
@@ -1057,12 +1056,8 @@ class Endpoint:
         return "down", f"{type(e).__name__}: {str(e)[:160]}"
 
     @staticmethod
-    def http_failure(status: int, headers, text: str) -> tuple[str, str]:
-        text = text[:400]
-        m = NGROK_CODE.search(text)
-        code = headers.get("ngrok-error-code") or (m.group(0) if m else None)
-        return (classify(status, code),
-                f"HTTP {status}{' ' + code if code else ''}: {text[:200]}")
+    def http_failure(status: int, text: str) -> tuple[str, str]:
+        return classify(status), f"HTTP {status}: {text[:200]}"
 
     def before_request(self) -> tuple[str, str] | None:
         if self.api is None:
@@ -1093,7 +1088,7 @@ class Endpoint:
             return self.transport_failure(e)
         if r.status_code == 200:
             return "ok", r
-        return self.http_failure(r.status_code, r.headers, r.text)
+        return self.http_failure(r.status_code, r.text)
 
     async def call_stream(self, url: str, body: bytes | None, timeout: float
                           ) -> tuple[str, object]:
@@ -1112,7 +1107,7 @@ class Endpoint:
                     timeout=httpx.Timeout(timeout, connect=min(15.0, timeout))) as r:
                 if r.status_code != 200:
                     detail = (await r.aread()).decode("utf-8", "replace")
-                    return self.http_failure(r.status_code, r.headers, detail)
+                    return self.http_failure(r.status_code, detail)
                 async for line in r.aiter_lines():
                     if not line.startswith("data:"):
                         continue
