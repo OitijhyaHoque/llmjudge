@@ -387,6 +387,13 @@ class ItemsTests(unittest.TestCase):
             self.assertIn("gender", str(cm.exception))
             self.assertEqual(len(cj.load_items(path, 42, ("age",))[0]), 2)
 
+    def test_a_nested_field_reaches_the_model_as_json(self):
+        """str() on a list hands the model Python: ['a', 'b'], single quotes and all."""
+        self.assertEqual(cj.render_user("drugs: {drugs}", {"drugs": ["insulin", "met"]}),
+                         'drugs: ["insulin", "met"]')
+        self.assertEqual(cj.render_user("v: {v}", {"v": {"a": 1, "b": None}}),
+                         'v: {"a": 1, "b": null}')
+
     def test_a_number_is_a_field_value_like_any_other(self):
         """`{"age": 70}` is valid JSON and a caller will write it sooner or later."""
         self.assertEqual(cj.render_user("age: {age}, n: {n}, x: {x}",
@@ -824,6 +831,21 @@ class ResumeSettingsTests(RunBase):
         self.assertEqual(meta["decoding"]["max_tokens"], 2048)        # restated
         self.assertEqual([s["decoding"]["max_tokens"] for s in meta["sessions"]], [96, 2048])
         self.assertEqual(self.judge("--temperature", "0.7"), cj.EXIT_CONFIG)
+
+    def test_an_unusable_results_line_does_not_stop_the_run(self):
+        """A line with no "key" used to raise KeyError before a single row was sent. Files
+        edited by hand, and files from a judge older than the items interface, look like
+        this."""
+        os.makedirs(self.out, exist_ok=True)
+        with open(os.path.join(self.out, "results.jsonl"), "w") as f:
+            f.write('{"id": "ctgan_split:1", "verdict": "consistent"}\n')    # no key
+            f.write('{"torn": "by a hard kill"\n')                           # not JSON
+            f.write('["a list, not an object"]\n')
+        self.assertEqual(self.judge(), cj.EXIT_OK)
+        with open(os.path.join(self.out, "summary.json")) as f:
+            summary = json.load(f)
+        self.assertEqual((summary["rows"], summary["missing"]), (POOL_ROWS, 0))
+        self.assertEqual(summary["unreadable_lines"], 3)
 
     def test_a_dry_run_does_not_pin_the_directory(self):
         """A dry run sends nothing and records nothing, so trying a second prompt in the

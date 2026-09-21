@@ -757,10 +757,14 @@ def read_results(path: str) -> tuple[dict[str, dict], int, int]:
                 continue
             try:
                 rec = json.loads(line)
-            except ValueError:
-                bad += 1                   # a line torn by a hard kill
+                key = rec["key"]
+            except (ValueError, TypeError, KeyError):
+                # Torn by a hard kill, edited by hand, or written by a judge older than
+                # the items interface. Skipping it costs one row; raising here killed the
+                # whole run before it had sent anything.
+                bad += 1
                 continue
-            latest[rec["key"]] = rec
+            latest[key] = rec
             n += 1
     return latest, n, bad
 
@@ -1983,7 +1987,7 @@ def run_main(args: argparse.Namespace) -> int:
 
     latest, lines, torn = read_results(os.path.join(out, "results.jsonl"))
     if torn:
-        log(f"results.jsonl: {torn} unreadable line(s) ignored; those rows will be re-sent")
+        log(f"results.jsonl: {torn} unusable line(s) ignored; those rows will be re-sent")
     skip = {k for k, r in latest.items()
             if not (args.retry_errors and (r.get("error") or r.get("parse_error")))}
     selected = items[:args.limit] if args.limit else items

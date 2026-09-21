@@ -24,7 +24,7 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 51 tests, ~33s, no server needed
+python3 -m unittest discover -s tests -t .            # 53 tests, ~33s, no server needed
 llmjudge --items items.jsonl --out out/pilot \
     --prompt c3 --run-tag pilot-01 --dry-run
 ```
@@ -235,7 +235,7 @@ and every row is checked for every column before the run starts.
 | key | | |
 |---|---|---|
 | `id` | required | unique; the only thing tying a verdict back to a row, and never parsed here |
-| `fields` | required | the `{column}` substitutions for the user template; numbers and strings both |
+| `fields` | required | the `{column}` substitutions for the user template; a string, a number, or a nested list or object, which is written into the prompt as JSON |
 | `group`, `stratum` | optional | opaque labels that bucket `summary.json`; nothing here reads their meaning |
 | `weight` | optional, 1.0 | for the weighted rates, so a caller that sampled strata unequally can still report a population rate |
 
@@ -302,7 +302,8 @@ file; keep `max_concurrency` at or below vLLM's `--max-num-seqs`.
 **Preflight.** The whole items file is parsed and checked before a single request goes
 out — ids present and unique, `fields` an object, and **every row** carrying every
 `{column}` the prompt names — so a pool malformed on line 40,000 costs nothing rather than
-four hours. Field values may be numbers or strings; a number is rendered as it reads. Then,
+four hours. A field value may be a string, a number, or a nested list or object; a number
+is rendered as it reads, and anything nested is written as JSON rather than as Python. Then,
 per endpoint: the model listing must name the configured model — unless
 `--skip-model-check` says this API has no such listing — and a canary request must come
 back sound. Under guided decoding the canary's schema admits one value,
