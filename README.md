@@ -44,6 +44,51 @@ run in. `python3 -m llmjudge` is the same entry point as the `llmjudge` command.
 `--dry-run` renders the first prompt, prints it, and sends nothing. Always the first step
 against a new prompt or a new endpoint.
 
+## Your own prompt
+
+The prompt is yours. Four ways to give it, all equivalent once loaded — what is pinned and
+resumed on is the **text**, never where it came from.
+
+```bash
+llmjudge --prompt c3 ...                             # one that ships with the package
+llmjudge --prompt /content/drive/MyDrive/my-prompt   # a directory: system.md + user.md
+llmjudge --system drive/sys.md --user drive/row.md --prompt-name tickets   # any two files
+```
+
+```python
+from llmjudge import judge                           # in a notebook: the text itself
+
+SYSTEM = """You check support tickets for contradictions.
+Answer with this JSON object and nothing else:
+{"verdict": "consistent" | "inconsistent" | "unsure", "short_reason": "<15 words>"}
+"""
+USER = """Ticket {ticket_id}
+product: {product}
+opened:  {opened}
+closed:  {closed}
+"""
+
+judge(items="/content/drive/MyDrive/judge/items.jsonl",
+      out="/content/drive/MyDrive/judge/results/tickets",
+      run_tag="tickets-01", system=SYSTEM, user=USER, guided="off", limit=100)
+```
+
+`judge()` takes every command-line option with underscores (`max_tokens`, `retry_errors`,
+`dry_run`). `system=` and `user=` are the prompt text, or the path to a file holding it —
+a value that names an existing file is read, anything else is the prompt. The text is
+copied to `<out>/prompt/`, so a results directory always carries the prompt that produced
+it, and re-running the same cell resumes rather than starts again.
+
+Two rules any prompt has to follow, because they are what makes a reply machine-readable:
+
+- the system prompt contains exactly one JSON example line naming both keys, `verdict`
+  and `short_reason`. Its key order becomes the schema's order, so a prompt that asks the
+  model to reason before answering actually gets to;
+- `verdict` is one of `consistent`, `inconsistent`, `unsure`.
+
+The user template is free: any `{column}` in it is filled from the item's `fields`, and
+every row is checked for every column before the run starts.
+
 ## The interface
 
 **In** — one JSONL, one object per row:
@@ -56,7 +101,7 @@ against a new prompt or a new endpoint.
 | key | | |
 |---|---|---|
 | `id` | required | unique; the only thing tying a verdict back to a row, and never parsed here |
-| `fields` | required | the `{column}` substitutions for `prompts/<name>/user.md` |
+| `fields` | required | the `{column}` substitutions for the user template; numbers and strings both |
 | `group`, `stratum` | optional | opaque labels that bucket `summary.json`; nothing here reads their meaning |
 | `weight` | optional, 1.0 | for the weighted rates, so a caller that sampled strata unequally can still report a population rate |
 
@@ -77,7 +122,7 @@ llmjudge/
 │   ├── template.py   {column} substitution, and the refusal when a column is missing
 │   ├── prompts/<name>/  system.md + user.md — c1, c1r, c2, c2-reason-first, c3,
 │   │                 c3-reasoning, c3-reasoning-2. Inside the package so that pip
-│   │                 install ships them.
+│   │                 install ships them; your own prompt need not live here at all.
 │   └── __main__.py   python3 -m llmjudge
 ├── configs/endpoints.example.toml    names of env keys, never values
 ├── notebooks/

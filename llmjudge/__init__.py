@@ -5,4 +5,6 @@ dataset-specific column names: those live in `rule-builder` (authoring) and `jud
 (execution and the evaluation pipeline). The interface across that line is files.
 """
 
-__all__ = ["run", "template"]
+from .run import judge, main
+
+__all__ = ["judge", "main", "run", "template"]

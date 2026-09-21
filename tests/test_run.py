@@ -394,6 +394,46 @@ class RunTests(RunBase):
         self.assertEqual((summary["rows"], summary["missing"]), (POOL_ROWS, 0))
         self.assertFalse(os.path.exists(os.path.join(self.out, "judge.pid")))
 
+    def test_a_prompt_from_strings_in_a_notebook(self):
+        """A colleague pastes two strings into a cell; nothing is checked out, and the
+        run is the same run as the packaged prompt with the same text."""
+        packaged = cj.load_prompt("c2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = cj.judge(items=self.items, out=self.out, run_tag="t",
+                          system=packaged["system"], user=packaged["user"],
+                          endpoints=write_endpoints(self.root, self.server.port),
+                          timeout=10, probe_min=0.1, probe_max=0.4, give_up_after=20,
+                          progress_every=0.5, backoff_max=0.2)
+        self.assertEqual(rc, cj.EXIT_OK)
+        self.assert_one_record_per_row()
+        with open(os.path.join(self.out, "run.json")) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["prompt"], "custom")
+        self.assertEqual(meta["prompt_sha"], packaged["prompt_sha"])   # the text is what counts
+        with open(os.path.join(self.out, "prompt", "system.md")) as f:
+            self.assertEqual(f.read().strip(), packaged["system"])     # kept beside the results
+
+    def test_own_prompt_files_anywhere(self):
+        """--system and --user take any two paths: a folder on Drive, not a convention."""
+        packaged = cj.load_prompt("c2")
+        paths = []
+        for name, text in (("mine.md", packaged["system"]), ("row.md", packaged["user"])):
+            paths.append(os.path.join(self.root, name))
+            with open(paths[-1], "w") as f:
+                f.write(text)
+        self.assertEqual(self.judge("--dry-run", "--system", paths[0], "--user", paths[1],
+                                    "--prompt-name", "mine"), cj.EXIT_OK)
+        with open(os.path.join(self.out, "run.json")) as f:
+            meta = json.load(f)
+        self.assertEqual((meta["prompt"], meta["prompt_dir"]), ("mine", None))
+        self.assertEqual(meta["prompt_sha"], packaged["prompt_sha"])
+        self.assertEqual(self.judge("--dry-run", "--system", paths[0]), cj.EXIT_CONFIG)
+
+    def test_an_unknown_prompt_name_lists_what_there_is(self):
+        with self.assertRaises(cj.ConfigError) as cm:
+            cj.load_prompt("c9")
+        self.assertIn("'c3'", str(cm.exception))
+
     def test_an_unrenderable_row_is_recorded_and_does_not_hang(self):
         """Rendering happens inside the request task. When it raised, the in-flight slot
         was never returned, remaining() never reached zero, and the run sat at 85/86

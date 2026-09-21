@@ -250,21 +250,40 @@ def read_env(path: str) -> dict[str, str]:
 # prompt, schema, parsing
 
 
-def load_prompt(arg: str) -> dict:
-    d = resolve(arg) if os.sep in arg else os.path.join(PROMPTS, arg)
-    try:
-        with open(os.path.join(d, "system.md"), encoding="utf-8") as f:
-            system = f.read().strip()
-        with open(os.path.join(d, "user.md"), encoding="utf-8") as f:
-            user = f.read().strip()
-    except FileNotFoundError as e:
-        raise ConfigError(f"prompt {arg!r}: {e}") from e
+def build_prompt(name: str, system: str, user: str, directory: str | None = None) -> dict:
+    """The prompt as the run uses it. The text is what counts: `prompt_sha` is taken from
+    it, so the same two strings resume the same run whether they came from the package, a
+    folder on Drive, or a cell in a notebook."""
+    system, user = system.strip(), user.strip()
+    if not system or not user:
+        raise ConfigError(f"prompt {name!r}: the system and user prompts cannot be empty")
     order = key_order(system)
     schema = build_schema(order)
-    return {"name": os.path.basename(d.rstrip(os.sep)), "dir": d, "system": system,
-            "user": user, "order": order, "schema": schema,
+    return {"name": name, "dir": directory, "system": system, "user": user,
+            "order": order, "schema": schema,
             "prompt_sha": sha(system + "\0" + user),
             "schema_sha": sha(json.dumps(schema, separators=(",", ":")))}
+
+
+def read_text(path: str, what: str) -> str:
+    try:
+        with open(resolve(path), encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        raise ConfigError(f"{what}: {e}") from e
+
+
+def load_prompt(arg: str) -> dict:
+    """A name from the package, or a directory holding system.md and user.md -- a checkout,
+    a folder on Drive, anywhere."""
+    d = resolve(arg) if os.sep in arg else os.path.join(PROMPTS, arg)
+    if not os.path.isdir(d) and os.sep not in arg:
+        raise ConfigError(f"prompt {arg!r}: no such prompt in the package. It ships "
+                          f"{sorted(os.listdir(PROMPTS))}; a path to a directory with "
+                          f"system.md and user.md works too, as do --system and --user")
+    system = read_text(os.path.join(d, "system.md"), f"prompt {arg!r}")
+    user = read_text(os.path.join(d, "user.md"), f"prompt {arg!r}")
+    return build_prompt(os.path.basename(d.rstrip(os.sep)), system, user, d)
 
 
 def key_order(system: str) -> tuple[str, ...]:
@@ -1330,7 +1349,15 @@ def load_endpoints(path: str, only: list[str]) -> tuple[list[dict], str]:
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--prompt", default="c2", help="directory under prompts/, or a path")
+    ap.add_argument("--prompt", default="c2",
+                    help="a prompt that ships with the package (c1, c2, c3, ...), or a path "
+                         "to any directory holding system.md and user.md")
+    ap.add_argument("--system", help="path to your own system prompt; needs --user too, and "
+                                     "then --prompt is ignored")
+    ap.add_argument("--user", help="path to your own user template, the one with the "
+                                   "{column} placeholders")
+    ap.add_argument("--prompt-name", default="custom",
+                    help="what to call a --system/--user prompt in run.json and summary.json")
     ap.add_argument("--items", required=True,
                     help="JSONL, one object per row: id, fields, and optionally group, "
                          "stratum, weight")
@@ -1374,8 +1401,59 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIG
 
 
+def judge(items: str, out: str, run_tag: str, system: str | None = None,
+          user: str | None = None, **options) -> int:
+    """The notebook entry point. Same options as the command line, with underscores.
+
+        from llmjudge import judge
+        judge(items="/content/drive/MyDrive/judge/items.jsonl",
+              out="/content/drive/MyDrive/judge/results/pilot",
+              run_tag="pilot-01", system=SYSTEM, user=USER, guided="off", limit=100)
+
+    `system` and `user` are the prompt itself -- the text of a cell, or a path to a file
+    on Drive; a value that names an existing file is read, anything else is the prompt.
+    Give neither and `prompt="c3"` picks one of the prompts that ship with the package,
+    or `prompt="/content/drive/MyDrive/my-prompt"` a directory of your own.
+
+    Prompt text is written to `<out>/prompt/`, so the results directory always carries
+    the exact prompt that produced it, and a re-run from the same cell resumes.
+    """
+    argv = ["--items", str(items), "--out", str(out), "--run-tag", str(run_tag)]
+    if (system is None) != (user is None):
+        print("llmjudge: refused: system= and user= go together", file=sys.stderr)
+        return EXIT_CONFIG
+    if system is not None:
+        d = os.path.join(resolve(out), "prompt")
+        os.makedirs(d, exist_ok=True)
+        for name, text in (("system.md", system), ("user.md", user)):
+            path = os.path.join(d, name)
+            text = read_text(text, name) if _looks_like_a_path(text) else text
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text.strip() + "\n")
+            argv += [f"--{name.removesuffix('.md')}", path]
+    for k, v in options.items():
+        if v is None or v is False:
+            continue
+        flag = "--" + k.replace("_", "-")
+        argv += [flag] if v is True else [flag, str(v)]
+    return main(argv)
+
+
+def _looks_like_a_path(text: str) -> bool:
+    """A prompt is many lines; a path is one short line that exists on disk."""
+    return "\n" not in text.strip() and len(text) < 4096 and os.path.isfile(resolve(text))
+
+
 def run_main(args: argparse.Namespace) -> int:
-    prompt = load_prompt(args.prompt)
+    if bool(args.system) != bool(args.user):
+        raise ConfigError("--system and --user go together: one is the system prompt, the "
+                          "other the user template with the {column} placeholders")
+    if args.system:
+        prompt = build_prompt(args.prompt_name,
+                              read_text(args.system, "--system"),
+                              read_text(args.user, "--user"))
+    else:
+        prompt = load_prompt(args.prompt)
     guided = args.guided == "on"
     if args.max_tokens is None:
         args.max_tokens = 96 if guided else 1024
@@ -1386,7 +1464,8 @@ def run_main(args: argparse.Namespace) -> int:
 
     columns = tuple(dict.fromkeys(PLACEHOLDER.findall(prompt["user"])))
     items, items_sha, order_csv = load_items(items_path, args.seed, columns)
-    meta = {"prompt": prompt["name"], "prompt_dir": rel(prompt["dir"]),
+    meta = {"prompt": prompt["name"],
+            "prompt_dir": rel(prompt["dir"]) if prompt["dir"] else None,
             "prompt_sha": prompt["prompt_sha"], "key_order": list(prompt["order"]),
             "guided": guided,
             # Unguided nothing is sent, but the sha still pins the key order the prompt asks
