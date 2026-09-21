@@ -1777,8 +1777,11 @@ def load_endpoints(path: str, only: list[str]) -> list[dict]:
     return eps
 
 
-def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+def build_parser() -> argparse.ArgumentParser:
+    # allow_abbrev=False: `--max-token 4096` is a typo, not a shorter spelling of
+    # --max-tokens. Abbreviations also let a judge() keyword with a typo through as a
+    # prefix of the option next to it, which then changed a setting nobody asked for.
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0], allow_abbrev=False)
     ap.add_argument("--prompt",
                     help="required: a prompt that ships with the package (c1, c2, c3, ...), "
                          "or a path to any directory holding system.md and user.md. There "
@@ -1867,7 +1870,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--progress-every", type=float, default=60.0)
     ap.add_argument("--dry-run", action="store_true",
                     help="write the send order, prompt and request examples; call nothing")
-    return ap.parse_args(argv)
+    return ap
+
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1906,10 +1913,16 @@ def judge(items: str, out: str, run_tag: str, system: str | None = None,
     Prompt text is written to `<out>/prompt/`, so the results directory always carries
     the exact prompt that produced it, and a re-run from the same cell resumes.
     """
-    argv = ["--items", str(items), "--out", str(out), "--run-tag", str(run_tag)]
     if (system is None) != (user is None):
         print("llmjudge: refused: system= and user= go together", file=sys.stderr)
         return EXIT_CONFIG
+    try:
+        # Before the prompt is written: a refused call should leave no directory behind.
+        options_argv = _options_argv(options)
+    except ConfigError as e:
+        print(f"llmjudge: refused: {e}", file=sys.stderr, flush=True)
+        return EXIT_CONFIG
+    argv = ["--items", str(items), "--out", str(out), "--run-tag", str(run_tag)]
     if system is not None:
         d = os.path.join(resolve(out), "prompt")
         os.makedirs(d, exist_ok=True)
@@ -1919,7 +1932,28 @@ def judge(items: str, out: str, run_tag: str, system: str | None = None,
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text.strip() + "\n")
             argv += [f"--{name.removesuffix('.md')}", path]
+    return main(argv + options_argv)
+
+
+def _options_argv(options: dict) -> list[str]:
+    """judge()'s keywords as command-line arguments, checked against the parser first.
+
+    Checked, rather than handed straight to argparse, for two reasons. A cell that
+    misspells an option should hear one line about it instead of a usage wall and a
+    SystemExit. And a bool means something only for the options that take no value:
+    `--guided` is on/off, so `guided=False` used to be dropped as "unset" and the run
+    went out guided anyway, which is the opposite of what the cell asked for.
+    """
+    actions = {a.dest: a for a in build_parser()._actions if a.dest != "help"}
+    argv: list[str] = []
     for k, v in options.items():
+        a = actions.get(k)
+        if a is None:
+            raise ConfigError(f"no option {k!r}. judge() takes the command-line options "
+                              f"with underscores: {', '.join(sorted(actions))}")
+        if isinstance(v, bool) and a.nargs != 0:     # nargs 0 is a bare flag, --dry-run
+            wanted = f"one of {list(a.choices)}" if a.choices else "a value"
+            raise ConfigError(f"{k}={v!r}: {k} takes {wanted}, not a bool")
         if v is None or v is False:
             continue
         flag = "--" + k.replace("_", "-")
@@ -1932,7 +1966,7 @@ def judge(items: str, out: str, run_tag: str, system: str | None = None,
                 argv += [flag, str(one)]
         else:
             argv += [flag, str(v)]
-    return main(argv)
+    return argv
 
 
 def _looks_like_a_path(text: str) -> bool:

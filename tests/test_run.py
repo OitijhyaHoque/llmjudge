@@ -244,6 +244,51 @@ def read_lines(path: str) -> list[dict]:
 # pure functions
 
 
+class NotebookOptionTests(unittest.TestCase):
+    """judge()'s keywords are the command line's options, and a cell that gets one wrong
+    must be told so -- not have it quietly dropped or matched to its neighbour."""
+
+    SYSTEM = 'Judge it.\n{"verdict": "good" | "bad", "why": "<one sentence>"}'
+    USER = "Q: {q}\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.items = os.path.join(self.tmp.name, "rows.csv")
+        with open(self.items, "w") as f:
+            f.write("id,q\ne1,hi\n")
+        self.out = os.path.join(self.tmp.name, "out")
+
+    def judge(self, **options) -> int:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return cj.judge(items=self.items, out=self.out, run_tag="t",
+                            system=self.SYSTEM, user=self.USER, **options)
+
+    def test_a_bool_for_an_option_that_takes_a_value_is_refused(self):
+        """--guided is on/off. guided=False was dropped as "unset", so a cell asking for
+        an unguided run got a guided one -- schema and all -- and was never told."""
+        self.assertEqual(self.judge(guided=False, dry_run=True), cj.EXIT_CONFIG)
+        self.assertFalse(os.path.exists(self.out))       # refused before anything is written
+        self.assertEqual(self.judge(guided="off", dry_run=True), cj.EXIT_OK)
+        with open(os.path.join(self.out, "request_example.json")) as f:
+            self.assertNotIn("response_format", json.load(f))
+
+    def test_a_misspelled_option_is_refused_rather_than_abbreviated(self):
+        """--max-token is an unambiguous prefix of --max-tokens, so argparse used to take
+        it and set a budget the cell never asked for."""
+        self.assertEqual(self.judge(max_token=777, dry_run=True), cj.EXIT_CONFIG)
+        self.assertEqual(self.judge(no_such_option=1, dry_run=True), cj.EXIT_CONFIG)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            cj.main(["--items", self.items, "--out", self.out, "--run-tag", "t",
+                     "--prompt", "c2", "--max-token", "777"])     # the command line too
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_the_options_that_are_flags_still_take_bools(self):
+        self.assertEqual(cj._options_argv({"dry_run": True, "stream": False}), ["--dry-run"])
+        self.assertEqual(cj._options_argv({"drop": ["seed"], "extra": {"top_p": 0.9}}),
+                         ["--drop", "seed", "--extra", '{"top_p": 0.9}'])
+
+
 class ParserTests(unittest.TestCase):
     CONTRACT = cj.load_prompt("c2")["contract"]
 
