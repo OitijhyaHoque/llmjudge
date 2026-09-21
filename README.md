@@ -1,19 +1,21 @@
 # llmjudge — an LLM judge, and nothing else
 
-This repository sends rows to a model and records what it answers. It holds **no rules,
-no cards, no knowledge tables, no dataset-specific column names, and no opinion about what
-the model should answer** — the prompt decides that. Those live elsewhere:
+This repository picks rows out of a CSV, sends them to a model, and records what it
+answers. It holds **no rules, no cards, no knowledge tables, and no opinion about what the
+model should answer** — the prompt decides that.
 
 ```
-rule-builder/   authors card.json + knowledge/        writes
-judge-0/        runs the rules, builds the pool,      writes items  ─┐
-                evaluates the filtered corpus         reads verdicts ─┤
-llmjudge/       sends rows to a model                                ─┘
+CSV + pool spec ──make-items──> items.jsonl ──judge──> results.jsonl + summary.json
 ```
 
-The line between them is **files**, never an import. Nothing here reads a `card.json` or
-a `decisions.csv`, so a colleague with a different dataset — or no rules at all — can use
-it unchanged.
+Both halves are here, and nothing outside this repository is needed to run either. A
+colleague with a different dataset — or no rules at all — uses it unchanged: `make-items`
+reads ordinary CSV columns, and the judge sees only `fields`.
+
+Rule authoring and the evaluation pipeline live elsewhere (`rule-builder`, `judge-0`).
+The line to them is **files on disk, never an import**: they produce a `table.csv` and
+optionally an attributes CSV, and they read `results.jsonl` back. Nothing here imports
+from them, and the seven prompts that ship are Diabetes 130 examples, not a dependency.
 
 ## Quickstart
 
@@ -24,9 +26,12 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 71 tests, ~33s, no server needed
+python3 -m unittest discover -s tests -t .            # 87 tests, ~33s, no server needed
+
+llmjudge make-items --spec configs/pool.diabetes130.toml --pool pilot \
+    --root /path/to/judge-0 --out items.jsonl         # draw the pool
 llmjudge --items items.jsonl --out out/pilot \
-    --prompt c3 --run-tag pilot-01 --dry-run
+    --prompt c3 --run-tag pilot-01 --dry-run          # check it before spending a GPU
 ```
 
 From anywhere else — a Colab notebook, a colleague's machine — install the tag instead,
@@ -283,8 +288,25 @@ and model, the prompt and schema shas, latency and token counts, and `error` / `
 where there is one. Errors are recorded, never
 dropped, so a re-run retries exactly them.
 
-Building the items file is the caller's job, deliberately: stratifying a pool needs to know
-what a rule decided, and this repository holds no rules.
+### Building the items file
+
+`llmjudge make-items` draws the pool. It reads a CSV of rows and, optionally, a second CSV
+of per-row attributes — a rules `decisions.csv`, a labelling, a clustering — that steer
+selection and stratification without ever reaching the model:
+
+```bash
+llmjudge make-items --spec configs/pool.diabetes130.toml --pool full \
+    --root /path/to/judge-0 --out items/full.jsonl
+```
+
+The spec names the tables, the groups (`select` by column value, `stratum` by format
+string, `alloc` proportional or equal) and one or more named sizes. `configs/pool.diabetes130.toml`
+is a worked example. Same spec and `--seed` gives the same file, and `<out>.meta.json`
+records the spec sha and the input shas beside it.
+
+Only `fields` is handed to the prompt. `group`, `stratum` and `weight` ride along for
+reporting and come back out in `summary.json`; the index and every attributes column stay
+out of the file the model sees.
 
 ## Layout
 
@@ -292,18 +314,21 @@ what a rule decided, and this repository holds no rules.
 llmjudge/
 ├── llmjudge/
 │   ├── run.py        the judge: endpoint pool, retries, breakers, resume, summary
+│   ├── items.py      make-items: CSVs + a pool spec -> items.jsonl
 │   ├── colab.py      the Colab cell: Drive in, Drive out, mirror verified at exit
 │   ├── template.py   {column} substitution, and the refusal when a column is missing
 │   ├── prompts/<name>/  system.md + user.md — c1, c1r, c2, c2-reason-first, c3,
 │   │                 c3-reasoning, c3-reasoning-2. Inside the package so that pip
 │   │                 install ships them; your own prompt need not live here at all.
 │   └── __main__.py   python3 -m llmjudge
-├── configs/endpoints.example.toml    names of env keys, never values
+├── configs/endpoints.example.toml     names of env keys, never values
+├── configs/pool.diabetes130.toml      a worked pool spec, as an example of the shape
 ├── notebooks/
 │   ├── serve_vllm.py    the Colab cell that serves MedGemma behind a Cloudflare tunnel
-│   └── judge_local.py   the readable reference loop: items.jsonl → verdicts.jsonl
+│   └── judge_local.py   a second, incompatible judge — see "What is still to do"
 └── tests/            mock_vllm.py + test_run.py against a threaded fake server,
-                      and test_colab.py against a Drive that is a temporary directory
+                      test_colab.py against a Drive that is a temporary directory,
+                      and test_items.py over small synthetic CSVs
 ```
 
 ## What the judge guarantees
@@ -376,17 +401,17 @@ anyway, so a fixed key bought nothing and could only leak.
 
 ## What is still to do
 
-Steps 1 and 2 of `notes/20260921_044121-judge-plan.md` are done: the extraction, and the
-items interface. What the plan changes next:
+The extraction, the items interface and the pool builder are done; see
+`notes/20260921_102042-llmjudge-plan.md` for the corrected plan. What is left:
 
-1. **Nobody writes the items file yet.** Step 3 moves pool construction and stratification
-   into `judge-0/pipeline/judge_stage.py`, which writes items and reads verdicts. Until
-   then a caller emits the JSONL itself.
-2. **One provider shape.** Step 4 adds `providers.py`: the OpenAI-compatible path stays the
-   default, and an Anthropic adapter joins it for the frontier-model comparison.
-3. **There is no ready-made judging notebook.** `llmjudge/colab.py` is there and the cell
+1. **One provider shape.** The request body is OpenAI chat-completions, always, so
+   `--chat-path` cannot actually reach Anthropic or OpenAI's `/responses`. A `providers.py`
+   adds the second shape.
+2. **There is no ready-made judging notebook.** `llmjudge/colab.py` is there and the cell
    is four lines (see "Colab" above), but `notebooks/run_judge.ipynb` — the file a
    colleague opens rather than types — is not written yet.
+3. **`notebooks/judge_local.py` is a second, incompatible judge** and is described above as
+   a reference loop, which it is not. Delete it or rewrite it.
 
 Runs made before the items interface keyed resume on `(table sha, arm, row index)`. They do
 not resume here, by decision; their `results.jsonl` stays readable.

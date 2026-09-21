@@ -1819,6 +1819,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "make-items":
+        from . import items
+        return items.main(argv[1:])
     args = parse_args(argv)
     try:
         return run_main(args)

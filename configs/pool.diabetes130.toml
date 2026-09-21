@@ -1,0 +1,47 @@
+# The Diabetes 130 pool, as an example of the spec shape.
+#
+#   llmjudge make-items --spec configs/pool.diabetes130.toml --pool full \
+#       --root /path/to/judge-0 --out items/full.jsonl
+#
+# Paths are relative to --root (default: this file's directory). Nothing here is read by
+# the judge: it sees `fields` and nothing else, so `kept`, `decision` and `checks` steer
+# the sampling without ever reaching the model.
+
+[tables.ctgan_split]
+rows  = "runs/split-ctgan-e300-gpu/normalize/ctgan_split/table.csv"
+attrs = "runs/split-ctgan-e300-gpu/rules/ctgan_split/decisions.csv"
+
+[tables.real_test]
+rows  = "runs/split-ctgan-e300-gpu/normalize/real_test/table.csv"
+attrs = "runs/split-ctgan-e300-gpu/rules/real_test/decisions.csv"
+
+# synthetic rows the rules kept, spread over decision x label
+[groups.kept]
+table   = "ctgan_split"
+alloc   = "proportional"
+select  = { kept = "1" }
+stratum = "{decision}/label={label}"
+
+# rows a knowledge check rejected: the positive controls, evenly over the two checks
+[groups.positive]
+table   = "ctgan_split"
+alloc   = "equal"
+select  = { decision = "reject", checks = ["kb.sex_diagnosis", "kb.age_diagnosis"] }
+stratum = "{checks}"
+
+# real held-out rows the rules kept: the negative control
+[groups.test]
+table   = "real_test"
+alloc   = "proportional"
+select  = { kept = "1" }
+stratum = "label={label}"
+
+[sizes.pilot]
+kept = 50
+positive = 25
+test = 25
+
+[sizes.full]
+kept = 0          # every eligible row
+positive = 500
+test = 2000
