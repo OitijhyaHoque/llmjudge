@@ -24,7 +24,7 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 53 tests, ~33s, no server needed
+python3 -m unittest discover -s tests -t .            # 71 tests, ~33s, no server needed
 llmjudge --items items.jsonl --out out/pilot \
     --prompt c3 --run-tag pilot-01 --dry-run
 ```
@@ -46,6 +46,43 @@ run in. `python3 -m llmjudge` is the same entry point as the `llmjudge` command.
 `--dry-run` renders the first prompt, prints it, and sends nothing. Always the first step
 against a new prompt or a new endpoint. It writes no `run.json`, so you can dry-run one
 prompt after another into the same directory and compare them.
+
+## Colab, and keeping the results on Drive
+
+A Colab runtime is temporary; Drive is not. `llmjudge.colab.run()` runs the judge on
+`/content` — local disk, where append and fsync mean what they say — and copies the
+results up to Drive every 100 s and once more at the end. Appending straight to the Drive
+FUSE mount is not reliable, which is why the results are not simply written there.
+
+Cell 1 is `notebooks/serve_vllm.py`, which starts the server. Cell 2 is this:
+
+```python
+!pip -q install "git+https://{userdata.get('GH_TOKEN')}@github.com/<org>/llmjudge.git@v0.1.0"
+
+from llmjudge.colab import run
+run(items="drive:genmd-judge/items.jsonl",
+    out="drive:genmd-judge/results/pilot",
+    run_tag="pilot-01", prompt="c3", limit=100)
+```
+
+Nothing else is pasted. `drive:` is `MyDrive/`, and the serving cell exports
+`LLMJUDGE_BASE_URL`, `LLMJUDGE_API_KEY` and `LLMJUDGE_MODEL`, so the judge finds the
+server by itself; that URL is `127.0.0.1`, not the tunnel, so no Cloudflare 524 can cut a
+slow reply and the timeout defaults to 600 s instead of 95. Every other option is
+`judge()`'s, spelled the same way.
+
+**Re-running the cell resumes.** Whatever the last session left on Drive is copied back
+down first, so a recycled runtime costs only the requests that were in flight. There are
+no bundles and no zips: the items file is the only thing a colleague puts on Drive, and
+the code comes from a tag.
+
+**The mirror is verified, not assumed.** A copy that fails mid-run prints its error and
+carries on, which is right while there is still time to recover. At exit the line counts
+are compared, and a run whose answers are not all on Drive says so and exits `4` — so
+nobody closes a tab believing the work is saved.
+
+`run()` works off Colab too: an `out` that is not under `MyDrive/` is judged in place with
+no mirroring, which is what the tests do.
 
 ## Saying where the model is
 
@@ -255,6 +292,7 @@ what a rule decided, and this repository holds no rules.
 llmjudge/
 ├── llmjudge/
 │   ├── run.py        the judge: endpoint pool, retries, breakers, resume, summary
+│   ├── colab.py      the Colab cell: Drive in, Drive out, mirror verified at exit
 │   ├── template.py   {column} substitution, and the refusal when a column is missing
 │   ├── prompts/<name>/  system.md + user.md — c1, c1r, c2, c2-reason-first, c3,
 │   │                 c3-reasoning, c3-reasoning-2. Inside the package so that pip
@@ -264,7 +302,8 @@ llmjudge/
 ├── notebooks/
 │   ├── serve_vllm.py    the Colab cell that serves MedGemma behind a Cloudflare tunnel
 │   └── judge_local.py   the readable reference loop: items.jsonl → verdicts.jsonl
-└── tests/            mock_vllm.py + test_run.py against a threaded fake server
+└── tests/            mock_vllm.py + test_run.py against a threaded fake server,
+                      and test_colab.py against a Drive that is a temporary directory
 ```
 
 ## What the judge guarantees
@@ -317,6 +356,7 @@ costs one row rather than stalling a pool that can never finish.
 **Nothing is lost quietly.** A truncated reply (`finish_reason=length`) is recorded as an
 error, never as a verdict. Non-JSON or wrong-key replies are retried once, then recorded
 with `parse_error`. Exit codes: `0` every planned row recorded, `2` configuration refused,
+`4` (from `colab.run()` only) the rows were judged but are not all on Drive,
 `3` stopped incomplete. Ctrl-C once drains the in-flight requests and writes the summary;
 twice exits immediately, and every recorded line is already on disk.
 
@@ -344,9 +384,9 @@ items interface. What the plan changes next:
    then a caller emits the JSONL itself.
 2. **One provider shape.** Step 4 adds `providers.py`: the OpenAI-compatible path stays the
    default, and an Anthropic adapter joins it for the frontier-model comparison.
-3. **The Colab path is not here yet.** Step 5 adds `llmjudge/colab.py`: mount Drive, pull
-   any partial results down to resume, run against localhost, mirror the tail back every
-   100 s, verify the copy at exit. No bundles and no zips.
+3. **There is no ready-made judging notebook.** `llmjudge/colab.py` is there and the cell
+   is four lines (see "Colab" above), but `notebooks/run_judge.ipynb` — the file a
+   colleague opens rather than types — is not written yet.
 
 Runs made before the items interface keyed resume on `(table sha, arm, row index)`. They do
 not resume here, by decision; their `results.jsonl` stays readable.

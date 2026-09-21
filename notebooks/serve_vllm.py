@@ -376,6 +376,14 @@ with open(URL_FILE, "w") as f:
 os.environ["MEDGEMMA_BASE_URL"] = f"{PUBLIC_URL}/v1"
 os.environ["MEDGEMMA_API_KEY"] = API_KEY
 
+# What llmjudge.colab.run() reads, so a judge cell in this same notebook needs no
+# arguments about the server at all. The URL here is localhost, not the tunnel: a judge
+# running in this runtime should not leave it and come back through Cloudflare, which
+# would cut any reply the model spends more than ~100 s on.
+os.environ["LLMJUDGE_BASE_URL"] = f"http://127.0.0.1:{PORT}/v1"
+os.environ["LLMJUDGE_API_KEY"] = API_KEY
+os.environ["LLMJUDGE_MODEL"] = SERVED_MODEL
+
 
 # ============================================================
 # DONE
