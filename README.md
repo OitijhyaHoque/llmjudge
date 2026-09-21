@@ -263,10 +263,10 @@ re-running the same cell resumes rather than starts again.
 
 ### The answer shape comes from your prompt
 
-One rule, and it is the only one: the system prompt shows the **answer as a JSON example**,
-on its own line or lines, starting with `{`. That example *is* the contract — the judge
-reads the keys, their order, and the values each may take out of it, and knows nothing else
-about your answer.
+One rule, and it is the only one: if you want an answer of a particular shape, the system
+prompt shows that **answer as a JSON example**, on its own line or lines, starting with
+`{`. That example *is* the contract — the judge reads the keys, their order, and the
+values each may take out of it, and knows nothing else about your answer.
 
 ```
 {"score": 1 | 2 | 3 | 4 | 5, "why": "<one sentence>"}
@@ -287,6 +287,24 @@ about your answer.
   a free number, is recorded whole like any other; there is then nothing to count, so the
   summary reports how many rows were answered and leaves the rates out, and the canary
   pins the first key instead.
+
+**A prompt that wants prose shows no example at all.** Not every judge answers in JSON —
+a critique, a rewrite, a paragraph of reasoning. Leave the example out, and the judge
+demands nothing: the reply is recorded whole as the `answer`, exactly as the model wrote
+it.
+
+```python
+judge(items="rows.csv", out="out/critique", run_tag="c-01", guided="off",
+      system="Write one paragraph on whether the answer is supported by the evidence.",
+      user="Q: {question}\nA: {candidate_answer}\n")
+```
+
+There is no schema to send, so a prose prompt runs only with **`--guided off`**
+(`guided="off"`); asking for guided decoding without an example is refused, and the
+refusal says both ways out. An empty reply is a parse error, a reply cut off at
+`--max-tokens` is still an error, and everything else is kept as it came. There is
+nothing categorical to count, so `summary.json` reports how many rows were answered and
+leaves the rates out.
 
 **Showing the model other examples.** Few-shot examples are between your prompt and the
 model, and the judge has no business reading them — but it cannot tell which object is the

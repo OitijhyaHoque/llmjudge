@@ -44,6 +44,10 @@ Guided decoding
     carries the label key, so prose and code fences around it are fine, and the text
     before it is kept as `reasoning`.
 
+    A prompt that shows no JSON example at all wants prose, and the whole reply is the
+    answer. It needs --guided off, because there is no schema to send; asking for guided
+    decoding without an example is refused.
+
     Unguided replies are long, so --max-tokens defaults to 1024 rather than 96. A reply
     cut off at the budget is recorded as an error, never as a verdict. After a pilot,
     read `truncated` in summary.json: if it is not 0, raise --max-tokens and re-run with
@@ -366,9 +370,9 @@ def load_prompt(arg: str) -> dict:
     return build_prompt(os.path.basename(d.rstrip(os.sep)), system, user, d)
 
 
-def example_block(system: str) -> str:
+def example_block(system: str) -> str | None:
     """The prompt's JSON example of the answer: a line that starts with `{`, up to its
-    closing brace.
+    closing brace. None when the prompt shows no example at all, which is a prose prompt.
 
     This is the contract. Whatever shape the example shows is the shape the judge demands,
     so nothing about the answer -- its keys, their order, or the values a label may take --
@@ -390,8 +394,7 @@ def example_block(system: str) -> str:
             blocks.append((start, "\n".join(buf)))
             depth, buf = 0, []
     if not blocks:
-        raise ConfigError("the system prompt must show the answer as a JSON example, on "
-                          "its own line(s) starting with '{'; found none")
+        return None            # no contract to demand: the answer is whatever it writes
     if len(blocks) == 1:
         return blocks[0][1]
     marked = [b for i, b in blocks if i and lines[i - 1].strip().lower() == ANSWER_FENCE]
@@ -524,8 +527,17 @@ def read_contract(system: str) -> dict:
     A prompt need not have one. An answer that is a free number, or prose and nothing
     else, is recorded whole like any other; there is simply nothing to count, so the
     summary reports how many rows were answered and leaves the rates out.
+
+    A prompt that shows no JSON example at all asks for prose, and gets a contract that
+    demands nothing: the reply is recorded as it was written. There is no schema to send,
+    so a prose prompt runs only with guided decoding off, and run_main refuses it with
+    that explanation rather than sending a schema the prompt never described.
     """
-    example = example_to_json(example_block(system))
+    block = example_block(system)
+    if block is None:
+        return {"order": (), "schema": None, "label": None, "values": [],
+                "canary_key": None, "prose": True}
+    example = example_to_json(block)
     if not isinstance(example, dict):
         raise ConfigError("the JSON example must be an object, not a "
                           f"{type(example).__name__}")
@@ -602,7 +614,14 @@ def parse_tolerant(content: str | None, contract: dict) -> dict:
 
     The keys and the label value are checked as strictly as on the guided path: a reply
     that misses either is a parse error, never a guessed answer.
+
+    A prose prompt asked for no shape, so there is nothing to find: the reply is the
+    answer. An empty one is still a parse error -- a row with no text is not judged.
     """
+    if contract.get("prose"):
+        text = (content or "").strip()
+        return ({"verdict": None, "answer": text, "key_order_ok": None} if text else
+                {"parse_error": "empty reply"})
     raw = content or ""
     body, note = THOUGHT.sub("", raw), None
     if raw.rfind("<unused94>") > raw.rfind("<unused95>"):
@@ -1992,6 +2011,13 @@ def run_main(args: argparse.Namespace) -> int:
             f"default, because the prompt is what decides what is being judged.")
     args.header = parse_headers(args.header)
     guided = args.guided == "on"
+    if prompt["contract"].get("prose") and guided:
+        raise ConfigError(
+            "this prompt shows no JSON example, so there is no schema to guide the model "
+            "with. Either add the answer's shape to the system prompt as a JSON example "
+            "on its own line -- {\"verdict\": \"good\" | \"bad\", \"why\": \"<one "
+            "sentence>\"} -- or pass --guided off (guided=\"off\") to take the reply as "
+            "prose and record it whole.")
     if args.max_tokens is None:
         args.max_tokens = 96 if guided else 1024
     if isinstance(args.extra, str):
@@ -2037,10 +2063,13 @@ def run_main(args: argparse.Namespace) -> int:
     log(f"items {rel(items_path)}: {len(items):,} rows -> {rel(order_path)}")
     for (g, st), c in sorted(counts.items()):
         log(f"  {g or '-':<9} {st or '-':<28} {c:>6}")
-    counted = (f"{prompt['label']} one of {prompt['values']}" if prompt["label"] else
-               "no key offers a choice, so nothing is counted and the canary pins "
-               f"{prompt['contract']['canary_key']!r}")
-    log(f"prompt {prompt['name']}: answers {list(prompt['order'])}, {counted}, guided "
+    shape = ("no JSON example, so the whole reply is the answer and nothing is counted"
+             if prompt["contract"].get("prose") else
+             f"answers {list(prompt['order'])}, " +
+             (f"{prompt['label']} one of {prompt['values']}" if prompt["label"] else
+              "no key offers a choice, so nothing is counted and the canary pins "
+              f"{prompt['contract']['canary_key']!r}"))
+    log(f"prompt {prompt['name']}: {shape}, guided "
         f"decoding {'on' if guided else 'off'}, max_tokens {args.max_tokens}, prompt sha "
         f"{prompt['prompt_sha'][:16]}, schema sha {prompt['schema_sha'][:16]}")
 

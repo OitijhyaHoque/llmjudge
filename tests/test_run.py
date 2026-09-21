@@ -42,6 +42,7 @@ with open(os.path.join(ROOT, "llmjudge", "prompts", "c2", "user.md"), encoding="
 POOL_ROWS = 45 + 13 + 28         # 86
 SLOW = {"ctgan_split:3", "ctgan_split:11", "ctgan_split:19", "ctgan_split:27"}
 BAD = "ctgan_split:5"            # the item the mock answers with HTTP 400
+PROSE = "Looks consistent to me, and this is the sentence saying why."   # unguided reply
 
 
 # --------------------------------------------------------------------------------------
@@ -133,22 +134,26 @@ def make_handler(state: MockState):
                 if state.dead:
                     self.close_connection = True
                     return
-                schema = req["response_format"]["json_schema"]["schema"]
-                enum = schema["properties"]["verdict"]["enum"]
-                if state.ignore_schema:
-                    obj = {"verdict": "consistent", "short_reason": "no conflict"}
-                else:
-                    verdict = enum[0] if len(enum) == 1 else (
-                        "inconsistent" if "gender: Male" in user and "diag_1: 650" in user
-                        else "consistent")
-                    values = {"verdict": verdict, "short_reason": "no conflict"}
-                    obj = {k: values[k] for k in schema["properties"]}
                 usage = {"prompt_tokens": len(user) // 4, "completion_tokens": 12}
+                if "response_format" not in req:
+                    content = PROSE            # unguided: the model writes what it likes
+                else:
+                    schema = req["response_format"]["json_schema"]["schema"]
+                    enum = schema["properties"]["verdict"]["enum"]
+                    if state.ignore_schema:
+                        obj = {"verdict": "consistent", "short_reason": "no conflict"}
+                    else:
+                        verdict = enum[0] if len(enum) == 1 else (
+                            "inconsistent" if "gender: Male" in user and "diag_1: 650" in user
+                            else "consistent")
+                        values = {"verdict": verdict, "short_reason": "no conflict"}
+                        obj = {k: values[k] for k in schema["properties"]}
+                    content = json.dumps(obj)
                 if req.get("stream"):
-                    return self._sse(json.dumps(obj), usage)
+                    return self._sse(content, usage)
                 self._json(200, {
                     "choices": [{"index": 0, "finish_reason": "stop",
-                                 "message": {"role": "assistant", "content": json.dumps(obj)}}],
+                                 "message": {"role": "assistant", "content": content}}],
                     "usage": usage})
             finally:
                 with state.lock:
@@ -351,10 +356,17 @@ class ParserTests(unittest.TestCase):
                              '{"verdict": "a" | "b", "why": "<15 words>"}\n```')
         self.assertEqual((c["order"], c["values"]), (("verdict", "why"), ["a", "b"]))
 
-    def test_a_prompt_with_no_json_at_all_is_refused(self):
-        with self.assertRaises(cj.ConfigError) as cm:
-            cj.read_contract("Say whether the record is consistent.")
-        self.assertIn("found none", str(cm.exception))
+    def test_a_prompt_with_no_json_at_all_asks_for_prose(self):
+        """No example means no contract: the judge demands nothing and records what the
+        model wrote. There is nothing to count and nothing to guide with."""
+        c = cj.read_contract("Say in one paragraph whether the record is consistent.")
+        self.assertEqual((c["prose"], c["order"], c["label"], c["schema"]),
+                         (True, (), None, None))
+        parsed = cj.parse_tolerant("  The record is fine, and here is why: …  ", c)
+        self.assertEqual(parsed["answer"], "The record is fine, and here is why: …")
+        self.assertIsNone(parsed["verdict"])
+        self.assertNotIn("parse_error", parsed)
+        self.assertEqual(cj.parse_tolerant("   ", c)["parse_error"], "empty reply")
 
 
 class PromptTests(unittest.TestCase):
@@ -799,6 +811,31 @@ class FlexibilityTests(RunBase):
         self.assertEqual(self.cli("--prompt", "c2", "--model", MODEL, "--limit", "3"),
                          cj.EXIT_OK)
         self.assertEqual(len(self.results), 3)
+
+    def test_a_prose_prompt_needs_no_json_example(self):
+        """Not every judge answers in JSON. A prompt that shows no example asks for prose,
+        and the reply is recorded as it was written -- there is simply nothing to count.
+        Guided decoding has no schema to send, so asking for both is refused."""
+        paths = []
+        for name, text in (("sys.md", "Say in one paragraph whether the record is consistent."),
+                           ("row.md", "Record: {label}\n")):
+            paths.append(os.path.join(self.root, name))
+            with open(paths[-1], "w") as f:
+                f.write(text)
+        both = ("--system", paths[0], "--user", paths[1], "--limit", "3")
+        self.assertEqual(self.judge(*both), cj.EXIT_CONFIG)        # --guided on, the default
+        self.assertFalse(os.path.exists(os.path.join(self.out, "run.json")))
+        self.assertEqual(self.judge(*both, "--guided", "off"), cj.EXIT_OK)
+        recs = self.results
+        self.assertEqual(len(recs), 3)
+        self.assertEqual({r["answer"] for r in recs}, {PROSE})
+        self.assertEqual({r["verdict"] for r in recs}, {None})
+        self.assertFalse([r for r in recs if r["parse_error"] or r["error"]])
+        with open(os.path.join(self.out, "summary.json")) as f:
+            summary = json.load(f)
+        self.assertEqual((summary["rows"], summary["parse_errors"], summary["missing"]),
+                         (3, 0, 0))
+        self.assertEqual(summary["values"], [])                    # nothing to count
 
     def test_a_missing_endpoints_file_says_what_to_do_instead(self):
         rc = self.cli("--prompt", "c2", "--endpoints", os.path.join(self.root, "nope.toml"),
