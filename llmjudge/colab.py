@@ -8,7 +8,7 @@ not reliable under append, which is why the results are not simply written there
 
     from llmjudge.colab import run
 
-    run(items="drive:judge/items.jsonl",
+    run(items="drive:judge/rows.csv",             # or an items .jsonl from make-items
         out="drive:judge/results/pilot",
         run_tag="pilot-01", prompt="c3", limit=100)
 
@@ -17,7 +17,7 @@ from the serving cell, which exported them. Re-running the cell resumes: whateve
 last session left on Drive is copied back down first, and a row already answered is
 never sent again.
 
-The items file is the only thing that goes on Drive. The code comes from a tag:
+The rows are the only thing that goes on Drive. The code comes from a tag:
 
     pip install "git+https://$GH_TOKEN@github.com/<org>/llmjudge.git@v0.1.0"
 """

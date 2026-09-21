@@ -47,13 +47,13 @@ A run needs:
 
 ### 2.1 Point at the rows to judge
 
-If the rows are already a CSV, pass it to `--items` directly. Every column becomes a
-field the user template can name:
+If the rows are already a CSV, pass it to `--items` directly. Every ordinary column
+becomes a field the user template can name:
 
 ```text
-question,candidate_answer
-What is 2 + 2?,4
-What is the capital of France?,London
+id,question,candidate_answer
+example-1,What is 2 + 2?,4
+example-2,What is the capital of France?,London
 ```
 
 ```bash
@@ -61,11 +61,17 @@ What is the capital of France?,London
 ```
 
 Four column names are reserved: `id`, `group`, `stratum` and `weight` are read as the
-item's keys rather than as fields, exactly as the JSONL keys below. Without an `id`
-column the row number is the id, which is all that resume needs.
+item's keys rather than as fields, exactly as the JSONL keys below. They are not shown
+to the model and cannot be `{placeholders}` in the user template. If `weight` is present,
+every value must be numeric.
 
-A CSV covers most runs. Write JSONL instead when a field is nested (an array or an
-object), or when the pool was sampled by stratum and carries weights.
+Without an `id` column, `llmjudge` uses the zero-based data-row position (`0`, `1`, ...).
+That is convenient for a one-off run. Use a stable, unique `id` column when the CSV may
+be reordered or extended, because resume matches existing results by ID.
+
+A CSV covers most runs, and its field values are strings. Write JSONL when a field must
+remain a typed nested array or object. Use `make-items` when a large CSV needs to be
+sampled or stratified before judging.
 
 #### The JSONL form
 
@@ -402,28 +408,27 @@ In the pool cell, point `ITEMS` at the uploaded file:
 ITEMS = f"{DRIVE}/rows.csv"
 ```
 
+The notebook's existing pool-inspection code reads JSONL. Replace that inspection code
+with this CSV version:
+
+```python
+import csv
+
+with open(ITEMS, newline="", encoding="utf-8-sig") as f:
+    rows = list(csv.DictReader(f))
+
+print(len(rows), "rows")
+print("columns:", list(rows[0]) if rows else [])
+```
+
 The packaged serving cell exports `LLMJUDGE_BASE_URL`, `LLMJUDGE_API_KEY`, and
 `LLMJUDGE_MODEL`, so the judging cell does not need endpoint arguments.
 
 ### Step 4: select the prompt and output
 
-The included judging cell uses a packaged prompt:
-
-```python
-from llmjudge.colab import run
-
-exit_code = run(
-    items=ITEMS,
-    out=f"{DRIVE}/results/pilot",
-    run_tag="pilot-01",
-    prompt="c3-reasoning-2",
-    guided=False,
-    max_tokens=2560,
-)
-print("exit", exit_code)
-```
-
-For the demo prompt created earlier, upload its files to Drive and pass their text:
+The tutorial CSV has `question` and `candidate_answer` columns, so use the demo prompt
+created earlier. Upload its files to `MyDrive/judge/prompts/demo/`, then replace the
+notebook's judging cell with:
 
 ```python
 from pathlib import Path
@@ -439,6 +444,9 @@ exit_code = run(
 )
 print("exit", exit_code)
 ```
+
+The notebook's original `prompt="c3-reasoning-2"` cell is for the included clinical
+example. Keep it only when the CSV contains every column named by that prompt.
 
 ### Step 5: run the cells from top to bottom
 
@@ -543,8 +551,9 @@ and are the appropriate figures when the items were sampled unequally by stratum
 
 ## 7. Common failures
 
-- **Missing template field:** add the named field to every item's `fields`, or remove the
-  placeholder from the user template. No request is sent until all rows validate.
+- **Missing template field:** add the named CSV column or JSONL field, or remove the
+  placeholder from the user template. Reserved CSV columns (`id`, `group`, `stratum`,
+  `weight`) are metadata, not prompt fields. No request is sent until all rows validate.
 - **Configured model is not served:** compare `--model` with `GET /v1/models`; for vLLM,
   set a stable name with `--served-model-name`.
 - **Server ignores `response_format`:** use a server with structured-output support, or
@@ -554,4 +563,3 @@ and are the appropriate figures when the items were sampled unequally by stratum
   result directory is intentionally pinned so incompatible answers cannot be mixed.
 - **Interrupted run:** run the same command again. `results.jsonl` is append-only and
   already completed rows are skipped.
-
