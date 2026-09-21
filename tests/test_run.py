@@ -58,6 +58,9 @@ class MockState:
         self.ignore_schema = False
         self.last_body = None        # the request as it arrived, for the --drop / --extra tests
         self.last_auth = None
+        self.last_path = None        # for the --chat-path / prefixed-base-url tests
+        self.last_headers: dict = {}
+        self.no_models = False       # an API that does not list its models, like Anthropic
         self.chat_calls = 0
         self.concurrent = 0
         self.max_concurrent = 0
@@ -82,7 +85,7 @@ def make_handler(state: MockState):
             if state.dead:
                 self.close_connection = True
                 return
-            if self.path.endswith("/models"):
+            if self.path.endswith("/models") and not state.no_models:
                 return self._json(200, {"object": "list", "data": [{"id": MODEL}]})
             self._json(404, {"error": "not found"})
 
@@ -93,6 +96,8 @@ def make_handler(state: MockState):
                 return
             with state.lock:
                 state.last_body = req
+                state.last_path = self.path
+                state.last_headers = {k.lower(): v for k, v in self.headers.items()}
                 state.last_auth = self.headers.get("Authorization")
                 state.chat_calls += 1
                 state.concurrent += 1
@@ -402,6 +407,9 @@ class RunBase(unittest.TestCase):
         return self.cli("--prompt", prompt, "--endpoints",
                         endpoints or write_endpoints(self.root, self.server.port), *extra)
 
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.port}/v1"
+
     def notebook_options(self) -> dict:
         return {"timeout": 10, "probe_min": 0.1, "probe_max": 0.4, "give_up_after": 20,
                 "progress_every": 0.5, "backoff_max": 0.2}
@@ -595,9 +603,6 @@ class ClassifyTests(unittest.TestCase):
 class FlexibilityTests(RunBase):
     """What a colleague must write before a run, and what a run may change afterwards."""
 
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.server.port}/v1"
-
     def test_one_endpoint_needs_no_endpoints_file_and_no_env_file(self):
         """--base-url and --model are a whole endpoint. The key comes from the
         environment, which is where a Colab serving cell already leaves it."""
@@ -629,7 +634,7 @@ class FlexibilityTests(RunBase):
         """Colab and Jupyter run a cell inside their own event loop, where asyncio.run
         raises. The notebook entry point has to work there or it is not one."""
         async def cell() -> int:
-            return cj.judge(items=self.items, out=self.out, run_tag="t",
+            return cj.judge(items=self.items, out=self.out, run_tag="t", prompt="c2",
                             base_url=self.url(), model=MODEL, limit=4,
                             **self.notebook_options())
         with contextlib.redirect_stdout(io.StringIO()):
@@ -683,6 +688,71 @@ class FlexibilityTests(RunBase):
         self.assertEqual(self.judge("--dry-run", "--extra", "not json"), cj.EXIT_CONFIG)
         self.assertEqual(self.judge("--dry-run", "--extra", "[1]"), cj.EXIT_CONFIG)
         self.assertEqual(self.state.chat_calls, 0)
+
+
+class ApiShapeTests(RunBase):
+    """An endpoint that is not shaped like vLLM: a path of its own, a key in another
+    header, no model listing."""
+
+    def test_a_base_url_with_a_path_is_used_exactly_as_given(self):
+        """Azure's /openai/deployments/<name>?api-version=..., a gateway prefix: the path
+        is the caller's, and a query string stays at the end where the API wants it."""
+        self.state.no_models = True
+        base = f"http://127.0.0.1:{self.server.port}/openai/deployments/dep?api-version=2024-06-01"
+        self.assertEqual(self.cli("--prompt", "c2", "--base-url", base, "--model", MODEL,
+                                  "--skip-model-check", "--limit", "2"), cj.EXIT_OK)
+        self.assertEqual(self.state.last_path,
+                         "/openai/deployments/dep/chat/completions?api-version=2024-06-01")
+
+    def test_a_bare_host_still_gets_v1(self):
+        """What every vLLM URL looked like before, and still does."""
+        self.assertEqual(self.cli("--prompt", "c2", "--base-url",
+                                  f"http://127.0.0.1:{self.server.port}", "--model", MODEL,
+                                  "--limit", "2"), cj.EXIT_OK)
+        self.assertEqual(self.state.last_path, "/v1/chat/completions")
+
+    def test_the_chat_path_and_the_key_header_are_the_callers(self):
+        """A path of the API's choosing, the key raw in a header of its choosing, a header
+        of your own, and a default header of the judge's dropped."""
+        os.environ["LLMJUDGE_API_KEY"] = "sk-test"
+        try:
+            self.assertEqual(self.cli(
+                "--prompt", "c2", "--base-url", self.url(), "--model", MODEL, "--limit", "2",
+                "--chat-path", "/messages", "--auth-header", "x-api-key",
+                "--header", "anthropic-version: 2023-06-01",
+                "--header", "ngrok-skip-browser-warning:"), cj.EXIT_OK)
+        finally:
+            del os.environ["LLMJUDGE_API_KEY"]
+        self.assertEqual(self.state.last_path, "/v1/messages")
+        self.assertEqual(self.state.last_headers.get("x-api-key"), "sk-test")
+        self.assertEqual(self.state.last_headers.get("anthropic-version"), "2023-06-01")
+        self.assertIsNone(self.state.last_auth)                       # no Bearer anywhere
+        self.assertNotIn("ngrok-skip-browser-warning", self.state.last_headers)
+
+    def test_an_api_that_lists_no_models_runs_on_the_canary_alone(self):
+        self.state.no_models = True
+        self.assertEqual(self.cli("--prompt", "c2", "--base-url", self.url(), "--model",
+                                  MODEL, "--skip-model-check", "--limit", "2"), cj.EXIT_OK)
+        self.assertEqual(len(self.results), 2)
+
+
+class ResumeSettingsTests(RunBase):
+    def test_a_raised_max_tokens_resumes_but_a_changed_temperature_does_not(self):
+        """A truncated reply is an error, never a verdict, so raising the budget to
+        recover those rows must not cost the rows already judged."""
+        self.assertEqual(self.judge("--limit", "3", "--max-tokens", "96"), cj.EXIT_OK)
+        self.assertEqual(self.judge("--max-tokens", "2048"), cj.EXIT_OK)
+        self.assertEqual(len(self.results), POOL_ROWS)                # resumed, not refused
+        with open(os.path.join(self.out, "run.json")) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["decoding"]["max_tokens"], 2048)        # restated
+        self.assertEqual([s["decoding"]["max_tokens"] for s in meta["sessions"]], [96, 2048])
+        self.assertEqual(self.judge("--temperature", "0.7"), cj.EXIT_CONFIG)
+
+    def test_a_run_with_no_prompt_is_refused_and_says_what_there_is(self):
+        rc = self.cli("--base-url", self.url(), "--model", MODEL)
+        self.assertEqual(rc, cj.EXIT_CONFIG)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "results.jsonl")))
 
 
 class HotSwapTests(RunBase):

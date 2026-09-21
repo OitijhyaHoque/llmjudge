@@ -24,7 +24,7 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 38 tests, ~25s, no server needed
+python3 -m unittest discover -s tests -t .            # 45 tests, ~30s, no server needed
 llmjudge --items items.jsonl --out out/pilot \
     --prompt c3 --run-tag pilot-01 --dry-run
 ```
@@ -64,6 +64,42 @@ configs/endpoints.example.toml configs/endpoints.toml`. An entry names the *envi
 variables* holding its URL and key, never the values. Those are read from the entry's
 `env_file` if there is one, and from the process environment otherwise.
 
+### When the API is not shaped like vLLM
+
+The base URL is used as you write it. A URL that already carries a path keeps that path,
+so Azure's deployment URL and a gateway's prefix work; only a bare host gets `/v1`
+appended, which is what every vLLM URL looked like before. A query string stays at the
+end, where Azure wants its `api-version`.
+
+Three more knobs move the rest of the request, and each also works per entry in the
+endpoints file (`chat_path`, `auth_header`, `headers`, `models_path`):
+
+```bash
+llmjudge --chat-path /responses                 # when it is not /chat/completions
+         --auth-header api-key                  # the key, raw, in another header
+         --header 'x-portkey-provider: azure'   # repeatable; an empty value removes one
+         --skip-model-check                     # this API lists no models
+```
+
+A key sent through a header other than `Authorization` goes raw, with no `Bearer` — that
+is what Azure wants. `--header` applies on top of every endpoint, so `--header
+'ngrok-skip-browser-warning:'` drops a default the judge would otherwise send.
+
+`--skip-model-check` turns off only the question *is this model served*. The canary still
+has to come back sound, so an endpoint is still proven before a single row is sent.
+
+Azure needs all four at once:
+
+```bash
+llmjudge --base-url 'https://R.openai.azure.com/openai/deployments/D?api-version=2024-06-01' \
+    --model gpt-4o-mini --auth-header api-key --skip-model-check --drop seed ...
+```
+
+What none of this changes is the **body**: a `messages` array with the system prompt as its
+first message, and `response_format` for guided decoding. An API with a body of its own —
+Anthropic's native `/v1/messages`, where the system prompt is a top-level field and there
+is no `response_format` — needs an adapter, which is step 4 of the plan, not these flags.
+
 ### When the API does not take the same fields
 
 Every request carries `model`, `messages`, `temperature`, `seed` and `max_tokens`.
@@ -83,8 +119,9 @@ command line's apply on top of every endpoint.
 
 ## Your own prompt
 
-The prompt is yours. Four ways to give it, all equivalent once loaded — what is pinned and
-resumed on is the **text**, never where it came from.
+The prompt is yours, and it is **required**: there is no default, because the prompt is the
+only thing that says what is being judged. Four ways to give it, all equivalent once loaded
+— what is pinned and resumed on is the **text**, never where it came from.
 
 ```bash
 llmjudge --prompt c3 ...                             # one that ships with the package
@@ -200,9 +237,14 @@ latest record is an error.
 not the items file. Append 2,000 rows to the file, re-run into the same directory, and
 only the new ids are sent. `run.json` restates which pool each session ran.
 
-**Refusal on a changed run.** `<out>/run.json` pins the prompt, the schema, the decoding
+**Refusal on a changed run.** `<out>/run.json` pins the prompt, the schema, the sampling
 settings, the send-order seed and the mode. A restart into that directory with any of them
 changed is refused rather than quietly mixing two kinds of answer in one file.
+
+`--max-tokens` is the one setting you may change. A reply cut off at the budget is recorded
+as an error and never as a verdict, so no answer on disk was shaped by the old budget:
+raise it, re-run with `--retry-errors`, and exactly the truncated rows are sent again. Each
+session's budget is kept in `run.json`'s `sessions`.
 
 **Endpoints that come and go.** Connection errors, `ERR_NGROK_*`, 502/503/504 and
 Cloudflare 520–527 pause an endpoint; `/v1/models` and a canary are re-probed with
@@ -219,7 +261,8 @@ file; keep `max_concurrency` at or below vLLM's `--max-num-seqs`.
 out — ids present and unique, `fields` an object, and **every row** carrying every
 `{column}` the prompt names — so a pool malformed on line 40,000 costs nothing rather than
 four hours. Field values may be numbers or strings; a number is rendered as it reads. Then,
-per endpoint: `/v1/models` must list the configured model, and a canary request must come
+per endpoint: the model listing must name the configured model — unless
+`--skip-model-check` says this API has no such listing — and a canary request must come
 back sound. Under guided decoding the canary's schema admits one value,
 so a server silently ignoring `response_format` is refused rather than producing a run of
 unconstrained replies.

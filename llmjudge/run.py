@@ -68,8 +68,10 @@ Failures
     gives up        only when every endpoint with work left has been down for
                     --give-up-after seconds, or none is usable.
 
-Preflight, per endpoint, before any row: `/v1/models` must list the configured model, and a
-canary request must come back sound. Guided, the canary's schema only allows verdict
+Preflight, per endpoint, before any row: the model listing must name the configured model,
+and a canary request must come back sound. An API that lists no models, or that lists
+deployment names rather than the name you send, runs with --skip-model-check and is proven
+by the canary alone. Guided, the canary's schema only allows verdict
 "canary-ok" and the reply must be exactly that in the schema's key order, so a server that
 silently ignores `response_format` is refused. Unguided there is nothing to enforce, so the
 canary only has to parse; a canary that does not parse is a warning, and the breaker that
@@ -84,8 +86,10 @@ Resume
     grew: add rows to the file, re-run into the same directory, and only the new ids are
     sent. Runs made before the items interface keyed on (table sha, arm, row index) and
     do not resume here; their results.jsonl stays readable.
-    `<out>/run.json` pins prompt, schema, decoding, order seed and mode; a restart with
-    any of them changed is refused. Ctrl-C once: stop sending, let in-flight requests
+    `<out>/run.json` pins prompt, schema, sampling, order seed and mode; a restart with
+    any of them changed is refused. --max-tokens is the exception: a reply cut off at the
+    budget is recorded as an error and never as a verdict, so raising it and re-running
+    with --retry-errors recovers exactly those rows and costs nothing already judged. Ctrl-C once: stop sending, let in-flight requests
     finish, write the summary. Twice: exit now (every recorded line is already on disk).
 
 Items (`--items`, one JSON object per line)
@@ -125,6 +129,22 @@ Endpoints
     renaming a field is a drop plus an add. Both show up in `request_example.json` under
     `--dry-run`, before anything is sent.
 
+    So does the transport. A base URL that already carries a path is used exactly as given
+    -- Azure's /openai/deployments/<name>?api-version=..., a gateway's prefix -- and only a
+    bare host gets /v1 appended. `--chat-path` moves the request, `--auth-header api-key`
+    puts the key in another header (raw, with no Bearer), `--header 'Name: value'` adds one
+    to every request and an empty value removes one, and `--skip-model-check` is for an API
+    that lists no models. Azure:
+
+    python3 -m llmjudge --skip-model-check --auth-header api-key --drop seed \\
+        --base-url 'https://R.openai.azure.com/openai/deployments/D?api-version=2024-06-01' \\
+        --model gpt-4o-mini ...
+
+    The body is still OpenAI's: a messages array with the system prompt inside it, and
+    response_format for guided decoding. An API with a body of its own -- Anthropic's
+    native /v1/messages, where the system prompt is a top-level field and there is no
+    response_format -- needs an adapter, not these flags.
+
     python3 -m llmjudge --items items.jsonl --out out/c3-pilot --prompt c3 \\
         --run-tag c3-pilot-01 --dry-run
     python3 -m llmjudge --items items.jsonl --out out/c3-pilot --prompt c3 \\
@@ -158,6 +178,7 @@ import sys
 import threading
 import time
 import tomllib
+import urllib.parse
 
 import httpx
 
@@ -223,6 +244,27 @@ def rel(path: str) -> str:
     `../../../../mnt/...` in run.json helps nobody reading it later."""
     r = os.path.relpath(path, os.getcwd())
     return path if r.startswith("..") else r
+
+
+def join(base: str, path: str) -> str:
+    """base + path, with any query string kept at the end where it belongs.
+
+    Azure carries `?api-version=...` on the base URL, and appending `/chat/completions`
+    after it would send the path into the query."""
+    head, sep, query = base.partition("?")
+    return head.rstrip("/") + path + sep + query
+
+
+def parse_headers(pairs: list[str]) -> dict[str, str]:
+    """`--header 'anthropic-version: 2023-06-01'` -> one entry. An empty value removes a
+    header the judge would otherwise send, the way a null in `--extra` removes a field."""
+    out: dict[str, str] = {}
+    for p in pairs:
+        name, sep, value = p.partition(":")
+        if not sep or not name.strip():
+            raise ConfigError(f"--header wants 'Name: value', got {p!r}")
+        out[name.strip()] = value.strip()
+    return out
 
 
 def quantile(values: list[float], p: float) -> float | None:
@@ -678,12 +720,17 @@ def read_results(path: str) -> tuple[dict[str, dict], int, int]:
 # What may not change between sessions writing into one results directory. The items
 # file is not on the list: a pool that grew is the ordinary case, and every row carries
 # its own id. What must not change is how a row was judged.
-PINNED = ("prompt", "prompt_sha", "schema_sha", "key_order", "guided", "decoding",
+PINNED = ("prompt", "prompt_sha", "schema_sha", "key_order", "guided",
           "order_seed", "mode")
 PINNED_DEFAULTS: dict = {}
+# `decoding` is checked field by field instead, and max_tokens is left out: raising the
+# budget is how a run recovers its truncated rows, and a reply cut off at max_tokens is
+# recorded as an error rather than a verdict, so no answer already on disk was shaped by
+# the old budget. Sampling -- temperature, seed -- is pinned like everything else.
+UNPINNED_DECODING = ("max_tokens",)
 # Re-stated every session instead, so run.json describes the pool that is there now and
 # the sessions list keeps the history.
-RESTATED = ("items", "items_sha", "items_rows", "order_sha")
+RESTATED = ("items", "items_sha", "items_rows", "order_sha", "decoding")
 
 
 def check_run_json(out: str, meta: dict, session: dict) -> None:
@@ -692,6 +739,9 @@ def check_run_json(out: str, meta: dict, session: dict) -> None:
         with open(path, encoding="utf-8") as f:
             old = json.load(f)
         diff = [k for k in PINNED if old.get(k, PINNED_DEFAULTS.get(k)) != meta.get(k)]
+        was, now = old.get("decoding") or {}, meta.get("decoding") or {}
+        diff += [f"decoding.{k}" for k in sorted(set(was) | set(now))
+                 if k not in UNPINNED_DECODING and was.get(k) != now.get(k)]
         if diff:
             raise ConfigError(
                 f"{rel(out)} was started with different {diff}. Use a new --run-tag; "
@@ -922,6 +972,13 @@ class Endpoint:
         self.extra = {**(cfg.get("extra") or {}), **(run.args.extra or {})}
         self.drop = list(cfg.get("drop") or []) + list(run.args.drop or [])
         self.metrics = bool(cfg.get("metrics", False))
+        # Where this API answers. Only a vLLM-shaped server has everything under
+        # <base>/v1: Anthropic answers at /messages, and an API with no model listing at
+        # all sets models_path = "" -- as --skip-model-check does -- so that preflight
+        # proves the endpoint with the canary alone.
+        self.chat_path = cfg.get("chat_path", "/chat/completions")
+        self.models_path = ("" if run.args.skip_model_check
+                            else cfg.get("models_path", "/models"))
         hi = int(cfg.get("max_concurrency", 128))
         self.tuner = Tuner(int(cfg.get("concurrency", 8)), int(cfg.get("min_concurrency", 1)), hi)
         self.max_connections = hi + 8
@@ -948,8 +1005,9 @@ class Endpoint:
 
     # -- configuration ---------------------------------------------------------------
     def load_env(self) -> None:
-        """Where the URL and the key come from, in order: the endpoint entry itself
-        (`--base-url`, `--api-key`), then the env file, then the process environment.
+        """Where the URL, the key and the headers come from, in order: the endpoint entry
+        itself (`--base-url`, `--api-key`), then the env file, then the process
+        environment.
 
         The env file does not have to exist. A Colab cell that ran `serve_vllm.py` already
         has the URL and the key in `os.environ`, and a vendor API usually has its key
@@ -963,7 +1021,13 @@ class Endpoint:
             raise ConfigError(f"endpoint {self.name}: no URL — {self.cfg['url_key']} is "
                               f"in none of {where}")
         url = (url if "://" in url else "https://" + url).rstrip("/")
-        root = url[:-3] if url.endswith("/v1") else url
+        parts = urllib.parse.urlsplit(url)
+        # A URL that already carries a path of its own is used exactly as it was given:
+        # Azure's /openai/deployments/<name>, Gemini's /v1beta/openai, a gateway's prefix.
+        # Only a bare host gets /v1 appended, which is what every vLLM URL looked like
+        # before, so nothing that worked stops working.
+        api = url if parts.path.strip("/") else join(url, "/v1")
+        root = f"{parts.scheme}://{parts.netloc}"        # vLLM serves /metrics at the root
         headers = dict(HEADERS)
         if self.cfg.get("auth_key"):
             cred = (self.cfg.get("api_key") or env.get(self.cfg["auth_key"])
@@ -971,11 +1035,24 @@ class Endpoint:
             if not cred:
                 raise ConfigError(f"endpoint {self.name}: no key — {self.cfg['auth_key']} "
                                   f"is in none of {where}")
-            if self.cfg.get("auth_scheme", "bearer") == "basic":
-                headers["Authorization"] = "Basic " + base64.b64encode(cred.encode()).decode()
-            else:
-                headers["Authorization"] = f"Bearer {cred}"
-        self.root, self.api, self.headers = root, root + "/v1", headers
+            # Anthropic sends the key raw in x-api-key and Azure raw in api-key, so a
+            # header that is not Authorization takes the key as it is unless the entry
+            # says otherwise.
+            name = self.cfg.get("auth_header", "Authorization")
+            scheme = self.cfg.get("auth_scheme") or ("bearer" if name == "Authorization"
+                                                     else "raw")
+            if scheme not in ("bearer", "basic", "raw"):
+                raise ConfigError(f"endpoint {self.name}: auth_scheme {scheme!r} is not "
+                                  f"one of bearer, basic, raw")
+            headers[name] = {
+                "bearer": f"Bearer {cred}",
+                "basic": "Basic " + base64.b64encode(cred.encode()).decode(),
+                "raw": cred}[scheme]
+        # The entry's own headers, then the run's --header, on top of both.
+        headers.update({str(k): str(v) for k, v in (self.cfg.get("headers") or {}).items()})
+        headers.update(self.run.args.header or {})
+        self.root, self.api = root, api
+        self.headers = {k: v for k, v in headers.items() if v != ""}   # "" removes one
 
     def event(self, text: str, loud: bool = True) -> None:
         self.events.append(f"{now_iso()} {text}")
@@ -992,7 +1069,7 @@ class Endpoint:
             return "quota", f"account {self.account} reached {self.quota_limit} requests"
         self.run.quota.add(self.account)
         self.stats["requests"] += 1
-        url = self.root + path if path == "/metrics" else self.api + path
+        url = join(self.root if path == "/metrics" else self.api, path)
         try:
             r = await self.client.request(
                 method, url, content=body, headers=self.headers,
@@ -1023,25 +1100,29 @@ class Endpoint:
 
     # -- health ----------------------------------------------------------------------
     async def preflight(self) -> str:
-        """/v1/models lists the model; then a canary. Guided, it proves the schema is
-        enforced; unguided there is nothing to enforce, so it only has to parse."""
+        """The model listing, where there is one, then a canary. Guided, the canary proves
+        the schema is enforced; unguided there is nothing to enforce, so it only has to
+        parse. An API that lists no models -- or lists deployment names rather than the
+        name you send -- skips the listing and is proven by the canary alone."""
         if self.api is None:
             try:
                 self.load_env()
             except ConfigError as e:
                 return self.set_down(f"waiting for its URL ({e})")
-        kind, r = await self.call("GET", "/models", None, 30)
-        if kind == "auth":
-            self.reload_env()
-            kind, r = await self.call("GET", "/models", None, 30)
-        if kind != "ok":
-            return self.set_down(f"/v1/models: {r}")
-        try:
-            self.served = [m["id"] for m in r.json()["data"]]
-        except (ValueError, KeyError, TypeError):
-            return self.set_down("/v1/models: unexpected payload")
-        if self.model not in self.served:
-            return self.refuse(f"model {self.model!r} is not served; server has {self.served}")
+        if self.models_path:
+            kind, r = await self.call("GET", self.models_path, None, 30)
+            if kind == "auth":
+                self.reload_env()
+                kind, r = await self.call("GET", self.models_path, None, 30)
+            if kind != "ok":
+                return self.set_down(f"{self.models_path}: {r}")
+            try:
+                self.served = [m["id"] for m in r.json()["data"]]
+            except (ValueError, KeyError, TypeError):
+                return self.set_down(f"{self.models_path}: unexpected payload")
+            if self.model not in self.served:
+                return self.refuse(f"model {self.model!r} is not served; server has "
+                                   f"{self.served}")
 
         run = self.run
         contract = run.prompt["contract"]
@@ -1050,11 +1131,11 @@ class Endpoint:
             self.model, run.prompt, run.render(run.canary_item), run.decoding, self.extra,
             schema=canary_schema(contract) if run.guided else None,
             name="canary", guided=run.guided, drop=self.drop)
-        kind, r = await self.call("POST", "/chat/completions", json.dumps(payload).encode(),
+        kind, r = await self.call("POST", self.chat_path, json.dumps(payload).encode(),
                                   run.args.timeout)
         if kind == "auth":
             self.reload_env()
-            kind, r = await self.call("POST", "/chat/completions",
+            kind, r = await self.call("POST", self.chat_path,
                                       json.dumps(payload).encode(), run.args.timeout)
         if kind == "bad_request":
             return self.refuse(f"canary request rejected: {r}")
@@ -1266,7 +1347,7 @@ class Run:
             body = json.dumps(build_payload(ep.model, self.prompt, self.render(it),
                                             self.decoding, ep.extra,
                                             guided=self.guided, drop=ep.drop)).encode()
-            kind, r = await ep.call("POST", "/chat/completions", body, self.args.timeout)
+            kind, r = await ep.call("POST", ep.chat_path, body, self.args.timeout)
         except Exception as e:
             # Rendering and serialising happen here, so a bug in either used to kill the
             # task before the in-flight slot was returned: remaining() then never reached
@@ -1437,6 +1518,7 @@ class Run:
                 "name": ep.name, "env_file": ep.cfg.get("env_file", ".env"),
                 "url_key": ep.cfg["url_key"], "auth_key": ep.cfg.get("auth_key") or None,
                 "model": ep.model, "served": ep.served, "state": ep.state,
+                "api": ep.api, "chat_path": ep.chat_path,
                 "account": ep.account, "quota": ep.quota_limit,
                 "quota_used_this_month": self.quota.used(ep.account),
                 "requests_this_session": ep.stats["requests"], "rows_this_session": ep.stats["rows"],
@@ -1563,6 +1645,10 @@ def cli_endpoint(args) -> list[dict]:
            "env_file": os.devnull}
     if args.base_url:
         cfg["url"] = args.base_url
+    if args.chat_path:
+        cfg["chat_path"] = args.chat_path
+    if args.auth_header:
+        cfg["auth_header"] = args.auth_header
     key = args.api_key or os.environ.get("LLMJUDGE_API_KEY")
     if key:                                # no key at all is fine: a local server needs none
         cfg["auth_key"], cfg["api_key"] = "LLMJUDGE_API_KEY", key
@@ -1594,9 +1680,11 @@ def load_endpoints(path: str, only: list[str]) -> tuple[list[dict], str]:
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--prompt", default="c2",
-                    help="a prompt that ships with the package (c1, c2, c3, ...), or a path "
-                         "to any directory holding system.md and user.md")
+    ap.add_argument("--prompt",
+                    help="required: a prompt that ships with the package (c1, c2, c3, ...), "
+                         "or a path to any directory holding system.md and user.md. There "
+                         "is no default -- the prompt is what decides what is judged. "
+                         "--system and --user give one instead")
     ap.add_argument("--system", help="path to your own system prompt; needs --user too, and "
                                      "then --prompt is ignored")
     ap.add_argument("--user", help="path to your own user template, the one with the "
@@ -1626,6 +1714,21 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--drop", action="append", default=[], metavar="FIELD",
                     help="remove a field from every request body (repeatable). --drop seed "
                          "--drop temperature for an API that rejects them")
+    ap.add_argument("--header", action="append", default=[], metavar="NAME:VALUE",
+                    help="a header on every request, over every endpoint (repeatable): "
+                         "--header 'anthropic-version: 2023-06-01'. An empty value removes "
+                         "a header the judge would otherwise send")
+    ap.add_argument("--auth-header",
+                    help="the header the key goes in when it is not Authorization: Bearer. "
+                         "x-api-key for Anthropic, api-key for Azure; the key is then sent "
+                         "raw, without a scheme")
+    ap.add_argument("--chat-path", metavar="PATH",
+                    help="the path appended to the base URL, default /chat/completions. "
+                         "/messages for Anthropic")
+    ap.add_argument("--skip-model-check", action="store_true",
+                    help="do not ask /models whether the model is served, for an API that "
+                         "has none or that lists deployment names. The canary still has to "
+                         "come back sound, so the endpoint is still proven before any row")
     ap.add_argument("--mode", choices=["shard", "compare"], default="shard")
     ap.add_argument("--limit", type=int, default=0, help="only the first N rows of the send order")
     ap.add_argument("--retry-errors", action="store_true",
@@ -1725,8 +1828,15 @@ def run_main(args: argparse.Namespace) -> int:
         prompt = build_prompt(args.prompt_name,
                               read_text(args.system, "--system"),
                               read_text(args.user, "--user"))
-    else:
+    elif args.prompt:
         prompt = load_prompt(args.prompt)
+    else:
+        raise ConfigError(
+            f"--prompt is required: one that ships with the package "
+            f"({', '.join(sorted(os.listdir(PROMPTS)))}), a path to a directory holding "
+            f"system.md and user.md, or --system and --user with your own. There is no "
+            f"default, because the prompt is what decides what is being judged.")
+    args.header = parse_headers(args.header)
     guided = args.guided == "on"
     if args.max_tokens is None:
         args.max_tokens = 96 if guided else 1024
@@ -1760,7 +1870,9 @@ def run_main(args: argparse.Namespace) -> int:
                "script_sha": file_sha(os.path.abspath(__file__)), "dry_run": args.dry_run,
                "pid": os.getpid(),
                # The pool may differ from session to session; which one this session ran.
-               "items": rel(items_path), "items_sha": items_sha, "items_rows": len(items)}
+               "items": rel(items_path), "items_sha": items_sha, "items_rows": len(items),
+               # max_tokens may be raised between sessions to recover truncated rows.
+               "decoding": decoding}
     os.makedirs(out, exist_ok=True)
     check_run_json(out, meta, session)
     order_path = os.path.join(out, "order.csv")

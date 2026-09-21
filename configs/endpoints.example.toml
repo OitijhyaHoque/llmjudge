@@ -26,6 +26,26 @@
 #                   drop = ["max_tokens"], extra = { max_completion_tokens = 4096 }
 # enabled = false   keep an entry without using it
 #
+# For an API that is not shaped like vLLM. The base URL is used as it is written: a URL
+# that already carries a path keeps it (Azure's /openai/deployments/<name>, a gateway
+# prefix), and only a bare host gets /v1 appended.
+# chat_path         the path the request goes to, default "/chat/completions".
+# models_path       the model listing preflight checks, default "/models". "" skips the
+#                   check, for an API that has none or that lists deployment names; the
+#                   canary still has to come back sound.
+# auth_header       the header the key goes in, default "Authorization". "api-key" for
+#                   Azure, "x-api-key" elsewhere -- and a header that is not
+#                   Authorization takes the key raw, with no "Bearer".
+# auth_scheme       "bearer" (the default for Authorization), "basic", or "raw".
+# headers           more headers for this endpoint, e.g.
+#                   headers = { x-portkey-provider = "azure" }. An empty value removes a
+#                   header the judge would otherwise send.
+#
+# Every endpoint here must speak the OpenAI chat-completions body: a messages array with
+# the system prompt as its first message, and response_format for guided decoding. An API
+# with a body of its own -- Anthropic's native /v1/messages, where the system prompt is a
+# top-level field -- needs an adapter, not these keys. That is step 4 of the plan.
+#
 # Every endpoint a run may use must be listed here when the run starts. Its URL may come
 # later: an endpoint whose url_key is not in its env file yet waits, and joins as soon as
 # the key appears (checked every few seconds).
@@ -58,6 +78,25 @@ max_concurrency = 16
 account = "cloudflare"
 quota = 0
 metrics = true
+
+# ---- A vendor API, for the frontier-model comparison in --mode compare. Disabled here
+#      because it costs money. Azure is the awkward shape: a deployment path, an
+#      api-version query, and the key in api-key rather than Authorization.
+
+[[endpoint]]
+name = "azure"
+enabled = false
+# https://<resource>.openai.azure.com/openai/deployments/<dep>?api-version=2024-06-01
+url_key = "AZURE_BASE_URL"           # the path and the query are kept as written
+auth_key = "AZURE_API_KEY"
+auth_header = "api-key"              # so the key is sent raw, without "Bearer"
+models_path = ""                     # Azure lists deployments, not model names
+model = "gpt-4o-mini"                # the deployment's model
+drop = ["seed"]
+concurrency = 4
+max_concurrency = 8
+account = "azure"
+quota = 2000                         # a ceiling, so nobody judges 55,000 rows by accident
 
 # ---- ngrok on the DGX Spark: disabled since the move to Cloudflare
 
