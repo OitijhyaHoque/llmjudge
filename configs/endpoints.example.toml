@@ -14,8 +14,6 @@
 #                   only queue inside vLLM, and behind Cloudflare the queue wait counts
 #                   toward the ~100 s after which the tunnel answers 524.
 # min_concurrency   floor after 429s / timeouts halve the window (default 1)
-# account, quota    requests are counted per account per UTC calendar month in quota_file,
-#                   preflight and probes included. 0 = not limited (Cloudflare, SSH).
 # metrics           poll vLLM /metrics every 10 s and stop growing while requests queue.
 #                   Only where requests are not capped.
 # extra             merged into every request body, e.g. for a thinking-capable model:
@@ -24,6 +22,9 @@
 #                   no seed, the reasoning models reject temperature, and newer OpenAI
 #                   models want max_completion_tokens -- renaming is drop plus extra:
 #                   drop = ["max_tokens"], extra = { max_completion_tokens = 4096 }
+# stream            read replies as server-sent events (--stream sets it for every
+#                   endpoint). Behind a tunnel that cuts a silent request -- Cloudflare
+#                   answers 524 after ~100 s -- this is what lets a slow reply finish.
 # enabled = false   keep an entry without using it
 #
 # For an API that is not shaped like vLLM. The base URL is used as it is written: a URL
@@ -50,8 +51,6 @@
 # later: an endpoint whose url_key is not in its env file yet waits, and joins as soon as
 # the key appears (checked every few seconds).
 
-quota_file = "runs/quota.json"
-
 # ---- Colab notebooks: notebooks/serve_vllm.py, vLLM 0.29.0, --max-num-seqs 16,
 #      Cloudflare tunnel
 
@@ -63,8 +62,6 @@ auth_key = "MEDGEMMA_API_KEY"
 model = "medgemma-27b-it"
 concurrency = 8
 max_concurrency = 16
-account = "cloudflare"
-quota = 0
 metrics = true
 
 [[endpoint]]
@@ -75,8 +72,6 @@ auth_key = "MEDGEMMA_API_KEY"        # both notebooks use the same key
 model = "medgemma-27b-it"
 concurrency = 8
 max_concurrency = 16
-account = "cloudflare"
-quota = 0
 metrics = true
 
 # ---- A vendor API, for the frontier-model comparison in --mode compare. Disabled here
@@ -95,8 +90,7 @@ model = "gpt-4o-mini"                # the deployment's model
 drop = ["seed"]
 concurrency = 4
 max_concurrency = 8
-account = "azure"
-quota = 2000                         # a ceiling, so nobody judges 55,000 rows by accident
+# What a run may spend here is capped with --max-requests, on the command line.
 
 # ---- ngrok on the DGX Spark: disabled since the move to Cloudflare
 
@@ -109,8 +103,6 @@ auth_key = "NGROK_API_KEY"           # bearer token, from .env
 model = "medgemma-27b-it"
 concurrency = 8
 max_concurrency = 128
-account = "ngrok-1"
-quota = 19000
 
 [[endpoint]]
 name = "spark-b"
@@ -121,5 +113,3 @@ auth_key = "NGROK_API_KEY_2"
 model = "medgemma-27b-it"
 concurrency = 8
 max_concurrency = 128
-account = "ngrok-2"                  # assumed separate from ngrok-1
-quota = 19000

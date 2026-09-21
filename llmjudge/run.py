@@ -33,6 +33,14 @@ retry. Check `truncated` in summary.json after a pilot before raising it.
 Plan: `notes/i-0093-02/newplan.md` §3-§6. One row per request: the whole row rendered into
 `prompts/<prompt>/user.md`, temperature 0. The model never sees the arm or the row index.
 
+Streaming
+    --stream reads a reply as server-sent events and assembles it. Cloudflare cuts a
+    request whose origin has sent nothing for ~100 s (524), so a prompt that reasons
+    before it answers can lose a row the model is still working on. Streamed, --timeout
+    measures silence rather than the whole reply and may go past the tunnel's limit; the
+    answer, its token counts and its finish reason are the same either way. Off by
+    default; `stream = true` sets it for one endpoint.
+
 Throughput
     Nothing is sent in batches. Each endpoint keeps a window of in-flight requests and
     starts the next one the moment any finishes, so a 100 s row holds one slot while the
@@ -40,8 +48,8 @@ Throughput
     it grows (+25%) while measured throughput keeps rising, steps back when a step bought
     nothing (the server is saturated), and halves on 429s and timeouts. Bounds come from
     `configs/endpoints.toml`. With `metrics = true` it also stops growing while vLLM
-    reports queued requests; that is off by default, because every poll through ngrok
-    counts against the monthly request quota.
+    reports queued requests; that is off by default, because every poll is one more
+    request through the tunnel.
 
 Failures
     endpoint down   connection errors, ngrok errors (ERR_NGROK_*), 502/503/504, Cloudflare
@@ -63,17 +71,19 @@ Failures
     400 / 422       recorded as an error for that row; 20 in a row refuses the endpoint.
     bad reply       non-JSON or wrong keys: retried once, then recorded with parse_error.
                     finish_reason=length is recorded as an error, never as a verdict.
-    quota           requests are counted per ngrok account per calendar month (UTC) in
-                    `quota_file`; an account stops at its `quota`.
+    ceiling         --max-requests N stops the whole run at N requests, rows, preflight
+                    and probes alike. It is what keeps a typo from judging 55,000 rows
+                    against a paid API. The stop is the Ctrl-C stop, so the answers
+                    already on disk stay and a re-run resumes from them.
     gives up        only when every endpoint with work left has been down for
                     --give-up-after seconds, or none is usable.
 
 Preflight, per endpoint, before any row: the model listing must name the configured model,
 and a canary request must come back sound. An API that lists no models, or that lists
 deployment names rather than the name you send, runs with --skip-model-check and is proven
-by the canary alone. Guided, the canary's schema only allows verdict
-"canary-ok" and the reply must be exactly that in the schema's key order, so a server that
-silently ignores `response_format` is refused. Unguided there is nothing to enforce, so the
+by the canary alone. Guided, the canary's schema allows one value for one key -- the
+label, or the first key when the prompt has no label -- and the reply must be exactly that
+in the schema's key order, so a server that silently ignores `response_format` is refused. Unguided there is nothing to enforce, so the
 canary only has to parse; a canary that does not parse is a warning, and the breaker that
 refuses an endpoint whose first 20 replies all fail parsing does the rest.
 
@@ -86,8 +96,9 @@ Resume
     grew: add rows to the file, re-run into the same directory, and only the new ids are
     sent. Runs made before the items interface keyed on (table sha, arm, row index) and
     do not resume here; their results.jsonl stays readable.
-    `<out>/run.json` pins prompt, schema, sampling, order seed and mode; a restart with
-    any of them changed is refused. --max-tokens is the exception: a reply cut off at the
+    The first real run writes `<out>/run.json`, which pins prompt, schema, sampling, order
+    seed and mode; a restart with any of them changed is refused. `--dry-run` writes no
+    run.json, so one prompt after another can be rendered into the same directory. --max-tokens is the exception: a reply cut off at the
     budget is recorded as an error and never as a verdict, so raising it and re-running
     with --retry-errors recovers exactly those rows and costs nothing already judged. Ctrl-C once: stop sending, let in-flight requests
     finish, write the summary. Twice: exit now (every recorded line is already on disk).
@@ -119,7 +130,7 @@ Modes
 
 Endpoints
     One server needs no files: `--base-url https://host/v1 --model NAME`, with the key in
-    `--api-key` or `LLMJUDGE_API_KEY`. Several, or one with a quota and a window of its
+    `--api-key` or `LLMJUDGE_API_KEY`. Several, or one with a concurrency window of its
     own, go in `--endpoints endpoints.toml`, where each entry names the environment
     variables holding its URL and key; those are read from the endpoint's env file if
     there is one and from the process environment otherwise.
@@ -165,7 +176,6 @@ import base64
 import collections
 import csv
 import datetime as dt
-import fcntl
 import hashlib
 import io
 import json
@@ -188,6 +198,7 @@ PROMPTS = os.path.join(HERE, "prompts")        # ships with the package, so pip 
 from .template import PLACEHOLDER, render_user
 
 CANARY = "canary-ok"
+ANSWER_FENCE = "```answer"          # marks the contract among a prompt's other examples
 HEADERS = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
 NGROK_CODE = re.compile(r"ERR_NGROK_\d+")
 FIRST = re.compile(r'write "(\w+)" FIRST')
@@ -345,26 +356,42 @@ def load_prompt(arg: str) -> dict:
 
 
 def example_block(system: str) -> str:
-    """The prompt's one JSON example: a line that starts with `{`, up to its closing brace.
+    """The prompt's JSON example of the answer: a line that starts with `{`, up to its
+    closing brace.
 
     This is the contract. Whatever shape the example shows is the shape the judge demands,
     so nothing about the answer -- its keys, their order, or the values a label may take --
     is written into this repository.
+
+    A prompt often shows the model more than one JSON object: worked examples, a few-shot
+    pair of a good and a bad answer. Those are between the prompt and the model and the
+    judge has no business reading them -- but it cannot tell which object is the contract
+    either, so the prompt says, by fencing that one in ```answer.
     """
-    lines, blocks, depth, buf = system.splitlines(), [], 0, []
-    for line in lines:
-        if depth == 0 and not line.lstrip().startswith("{"):
-            continue
+    lines, blocks, depth, buf, start = system.splitlines(), [], 0, [], 0
+    for i, line in enumerate(lines):
+        if depth == 0:
+            if not line.lstrip().startswith("{"):
+                continue
+            start = i
         buf.append(line)
         depth += braces(line)
         if depth <= 0:
-            blocks.append("\n".join(buf))
+            blocks.append((start, "\n".join(buf)))
             depth, buf = 0, []
-    if len(blocks) != 1:
-        raise ConfigError(f"the system prompt must show exactly one JSON example of the "
-                          f"answer, on its own line(s) starting with '{{'; found "
-                          f"{len(blocks)}")
-    return blocks[0]
+    if not blocks:
+        raise ConfigError("the system prompt must show the answer as a JSON example, on "
+                          "its own line(s) starting with '{'; found none")
+    if len(blocks) == 1:
+        return blocks[0][1]
+    marked = [b for i, b in blocks if i and lines[i - 1].strip().lower() == ANSWER_FENCE]
+    if len(marked) == 1:
+        return marked[0]
+    raise ConfigError(
+        f"the system prompt shows {len(blocks)} JSON objects and {len(marked)} of them are "
+        f"marked as the answer, so the judge cannot tell which one it must demand. Show "
+        f"the model as many examples as you like, and fence the one that is the contract:\n"
+        f"```answer\n{{\"verdict\": \"consistent\" | \"inconsistent\", \"why\": \"<15 words>\"}}\n```")
 
 
 def braces(line: str) -> int:
@@ -476,11 +503,17 @@ def schema_of(node) -> dict:
 
 
 def read_contract(system: str) -> dict:
-    """-> {order, schema, label, values}: what the prompt asks the model to answer.
+    """-> {order, schema, label, values, canary_key}: what the prompt asks the model to
+    answer.
 
     `label` is the first key whose example lists alternatives -- the categorical answer
-    the summary counts and the canary pins. `verdict` in the prompts that ship here,
-    `score` or `category` in yours; the name is the prompt's business, not this repo's.
+    the summary counts and the agreement check compares. `verdict` in the prompts that
+    ship here, `score` or `category` in yours; the name is the prompt's business, not
+    this repo's.
+
+    A prompt need not have one. An answer that is a free number, or prose and nothing
+    else, is recorded whole like any other; there is simply nothing to count, so the
+    summary reports how many rows were answered and leaves the rates out.
     """
     example = example_to_json(example_block(system))
     if not isinstance(example, dict):
@@ -489,23 +522,23 @@ def read_contract(system: str) -> dict:
     schema = schema_of(example)
     order = tuple(example)
     labels = [k for k in order if "enum" in schema["properties"][k]]
-    if not labels:
-        raise ConfigError("one key of the answer must list the values it may take, as "
-                          '"verdict": "consistent" | "inconsistent" | "unsure". That key '
-                          "is what the summary counts and what the canary pins.")
     first = FIRST.findall(system)
     if first and first[-1] != order[0]:
         raise ConfigError(f'the prompt says write "{first[-1]}" FIRST but its JSON example '
                           f'starts with "{order[0]}"')
-    return {"order": order, "schema": schema, "label": labels[0],
-            "values": schema["properties"][labels[0]]["enum"]}
+    return {"order": order, "schema": schema,
+            "label": labels[0] if labels else None,
+            "values": schema["properties"][labels[0]]["enum"] if labels else [],
+            # What the canary pins to one value. The label where there is one; otherwise
+            # the first key, which is enough to catch a server ignoring response_format.
+            "canary_key": labels[0] if labels else order[0]}
 
 
 def canary_schema(contract: dict) -> dict:
-    """The contract's schema with the label pinned to one value, so a server that ignores
+    """The contract's schema with one key pinned to one value, so a server that ignores
     `response_format` cannot produce it by accident."""
     schema = json.loads(json.dumps(contract["schema"]))
-    schema["properties"][contract["label"]] = {"type": "string", "enum": [CANARY]}
+    schema["properties"][contract["canary_key"]] = {"type": "string", "enum": [CANARY]}
     return schema
 
 
@@ -516,6 +549,13 @@ def check_answer(obj, contract: dict) -> dict:
     label = contract["label"]
     if set(obj) != set(contract["order"]):
         return {"parse_error": f"keys {sorted(obj)}"}
+    if label is None:
+        # Nothing in this answer is categorical, so the keys are the whole check and the
+        # answer is recorded as it came.
+        return {"verdict": None, "answer": obj,
+                "short_reason": obj.get("short_reason") if isinstance(
+                    obj.get("short_reason"), str) else None,
+                "key_order_ok": tuple(obj) == contract["order"]}
     value = obj[label]
     if isinstance(value, str):
         value = value.strip().lower() if isinstance(contract["values"][0], str) else value
@@ -558,16 +598,21 @@ def parse_tolerant(content: str | None, contract: dict) -> dict:
         # on 58 of 121 replies in runs/c1/ngrok-27b-c1r-stream.
         body = raw.replace("<unused94>", "").replace("<unused95>", "")
         note = "json inside unclosed thought"
+    label = contract["label"]
     decoder, found, at = json.JSONDecoder(), None, 0
     for m in re.finditer(r"\{", body):
         try:
             obj, _ = decoder.raw_decode(body, m.start())
         except ValueError:
             continue
-        if isinstance(obj, dict) and contract["label"] in obj:
+        # With a label, the answer is the object carrying it -- that is the one key the
+        # reasoning above cannot accidentally produce. Without one, all of the keys.
+        if isinstance(obj, dict) and (label in obj if label else
+                                      all(k in obj for k in contract["order"])):
             found, at = obj, m.start()
     if found is None:
-        return {"parse_error": f"no JSON object with a {contract['label']}: "
+        return {"parse_error": f"no JSON object with a "
+                               f"{label or ' and a '.join(contract['order'])}: "
                                f"{body.strip()[:80]!r}"}
     parsed = check_answer(found, contract)
     parsed.update(reasoning=body[:at].strip() or None, parse_note=note)
@@ -577,7 +622,7 @@ def parse_tolerant(content: str | None, contract: dict) -> dict:
 def build_payload(model: str, prompt: dict, user_text: str, decoding: dict,
                   extra: dict | None = None, schema: dict | None = None,
                   name: str = "c2_verdict", guided: bool = True,
-                  drop: list[str] | None = None) -> dict:
+                  drop: list[str] | None = None, stream: bool = False) -> dict:
     """The request body. `extra` adds or overrides fields, `drop` removes them, and a
     field set to null is removed too.
 
@@ -597,6 +642,9 @@ def build_payload(model: str, prompt: dict, user_text: str, decoding: dict,
     if guided:
         payload["response_format"] = {"type": "json_schema", "json_schema": {
             "name": name, "schema": schema or prompt["schema"], "strict": True}}
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}   # or no token counts at all
     payload.update(extra or {})
     for k in list(drop or []) + [k for k, v in payload.items() if v is None]:
         payload.pop(k, None)
@@ -756,7 +804,7 @@ def check_run_json(out: str, meta: dict, session: dict) -> None:
 def summarise(results_path: str, meta: dict) -> dict:
     latest, lines, bad = read_results(results_path)
     recs = list(latest.values())
-    label = meta.get("label", "verdict")
+    label = meta.get("label")
     values = meta.get("values") or sorted({r["verdict"] for r in recs if r.get("verdict")})
     out: dict = {"prompt": meta["prompt"], "items": meta.get("items"), "mode": meta["mode"],
                  "label": label, "values": values,
@@ -772,7 +820,8 @@ def summarise(results_path: str, meta: dict) -> dict:
                  "by_group": {}, "by_endpoint": {}}
     for g in sorted({r.get("group") or "all" for r in recs}):
         rs = [r for r in recs if (r.get("group") or "all") == g]
-        judged = [r for r in rs if r.get("verdict")]
+        # An answered row, whether or not the prompt asked for anything countable.
+        judged = [r for r in rs if r.get("answer") is not None]
         wsum = sum(r.get("weight") or 1.0 for r in judged) or 1.0
 
         def share(wanted, weighted):
@@ -783,7 +832,8 @@ def summarise(results_path: str, meta: dict) -> dict:
 
         out["by_group"][g] = {
             "rows": len(rs), "judged": len(judged),
-            "verdicts": dict(collections.Counter(r["verdict"] for r in judged)),
+            "verdicts": dict(collections.Counter(r["verdict"] for r in judged
+                                                 if r.get("verdict") is not None)),
             "not_judged": len(rs) - len(judged),
             # One share per value the prompt allows, whatever they are called.
             "rates": {str(v): share({v}, False) for v in values},
@@ -820,62 +870,6 @@ def summarise(results_path: str, meta: dict) -> dict:
                     "table": dict(collections.Counter(f"{v[a]}|{v[b]}" for v in both))}
         out["agreement"] = pairs
     return out
-
-
-# --------------------------------------------------------------------------------------
-# request quota, per ngrok account
-
-
-class Quota:
-    """Requests per account per UTC calendar month, shared by every run through a file."""
-
-    def __init__(self, path: str):
-        self.path = path
-        self.pending: collections.Counter = collections.Counter()
-        self.base = self._read()
-
-    def _read(self) -> dict:
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {}
-        except ValueError as e:
-            raise ConfigError(f"{self.path} is not valid JSON") from e
-
-    @staticmethod
-    def _key(account: str) -> str:
-        return f"{account}/{dt.datetime.now(dt.timezone.utc):%Y-%m}"
-
-    def used(self, account: str) -> int:
-        k = self._key(account)
-        return self.base.get(k, 0) + self.pending[k]
-
-    def add(self, account: str) -> None:
-        self.pending[self._key(account)] += 1
-        if sum(self.pending.values()) >= 50:
-            self.flush()
-
-    def flush(self) -> None:
-        if not self.pending:
-            return
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        with open(self.path, "a+", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            text = f.read()
-            data = json.loads(text) if text.strip() else {}
-            for k, v in self.pending.items():
-                data[k] = data.get(k, 0) + v
-            f.seek(0)
-            f.truncate()
-            json.dump(data, f, indent=1, sort_keys=True)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-            fcntl.flock(f, fcntl.LOCK_UN)
-        self.base = data
-        self.pending.clear()
 
 
 # --------------------------------------------------------------------------------------
@@ -943,10 +937,6 @@ class Tuner:
 # endpoint
 
 
-class QuotaHit(Exception):
-    pass
-
-
 def classify(status: int, ngrok_code: str | None) -> str:
     if status in (401, 403):
         return "auth"
@@ -966,8 +956,6 @@ class Endpoint:
         self.cfg, self.run = cfg, run
         self.name = cfg["name"]
         self.model = cfg["model"]
-        self.account = cfg.get("account") or self.name
-        self.quota_limit = int(cfg.get("quota", 0))
         # The run's own --extra / --drop apply to every endpoint, on top of its entry's.
         self.extra = {**(cfg.get("extra") or {}), **(run.args.extra or {})}
         self.drop = list(cfg.get("drop") or []) + list(run.args.drop or [])
@@ -977,6 +965,7 @@ class Endpoint:
         # all sets models_path = "" -- as --skip-model-check does -- so that preflight
         # proves the endpoint with the canary alone.
         self.chat_path = cfg.get("chat_path", "/chat/completions")
+        self.stream = bool(cfg.get("stream", run.args.stream))
         self.models_path = ("" if run.args.skip_model_check
                             else cfg.get("models_path", "/models"))
         hi = int(cfg.get("max_concurrency", 128))
@@ -1060,33 +1049,91 @@ class Endpoint:
             log(f"{self.name}: {text}")
 
     # -- transport -------------------------------------------------------------------
-    async def call(self, method: str, path: str, body: bytes | None, timeout: float
-                   ) -> tuple[str, object]:
-        """-> ("ok", response) or (failure class, detail). Never raises for the network."""
+    @staticmethod
+    def transport_failure(e: Exception) -> tuple[str, str]:
+        if isinstance(e, httpx.ConnectTimeout):
+            return "down", "connect timeout"
+        if isinstance(e, httpx.TimeoutException):
+            return "timeout", type(e).__name__
+        return "down", f"{type(e).__name__}: {str(e)[:160]}"
+
+    @staticmethod
+    def http_failure(status: int, headers, text: str) -> tuple[str, str]:
+        text = text[:400]
+        m = NGROK_CODE.search(text)
+        code = headers.get("ngrok-error-code") or (m.group(0) if m else None)
+        return (classify(status, code),
+                f"HTTP {status}{' ' + code if code else ''}: {text[:200]}")
+
+    def before_request(self) -> tuple[str, str] | None:
         if self.api is None:
             return "down", f"no URL: {self.cfg['url_key']} is not in the env file"
-        if self.quota_limit and self.run.quota.used(self.account) >= self.quota_limit:
-            return "quota", f"account {self.account} reached {self.quota_limit} requests"
-        self.run.quota.add(self.account)
+        stop = self.run.spend_one()
+        if stop:
+            return stop
         self.stats["requests"] += 1
+        return None
+
+    async def call(self, method: str, path: str, body: bytes | None, timeout: float,
+                   stream: bool = False) -> tuple[str, object]:
+        """-> ("ok", reply) or (failure class, detail). Never raises for the network.
+
+        `reply` is the httpx response, or -- streamed -- the chat completion assembled
+        from the events, in the shape the same call returns unstreamed."""
+        stop = self.before_request()
+        if stop:
+            return stop
         url = join(self.root if path == "/metrics" else self.api, path)
+        if stream:
+            return await self.call_stream(url, body, timeout)
         try:
             r = await self.client.request(
                 method, url, content=body, headers=self.headers,
                 timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)))
-        except httpx.ConnectTimeout:
-            return "down", "connect timeout"
-        except httpx.TimeoutException as e:
-            return "timeout", type(e).__name__
         except httpx.TransportError as e:
-            return "down", f"{type(e).__name__}: {str(e)[:160]}"
+            return self.transport_failure(e)
         if r.status_code == 200:
             return "ok", r
-        text = r.text[:400]
-        m = NGROK_CODE.search(text)
-        code = r.headers.get("ngrok-error-code") or (m.group(0) if m else None)
-        kind = classify(r.status_code, code)
-        return kind, f"HTTP {r.status_code}{' ' + code if code else ''}: {text[:200]}"
+        return self.http_failure(r.status_code, r.headers, r.text)
+
+    async def call_stream(self, url: str, body: bytes | None, timeout: float
+                          ) -> tuple[str, object]:
+        """The same call, read as server-sent events and assembled into one reply.
+
+        Cloudflare cuts a request whose origin has sent nothing for about 100 s (524), and
+        a prompt that reasons before it answers can spend longer than that on a reply the
+        server is still buffering: the tunnel kills a row the model is still working on.
+        Streamed, the timeout measures silence rather than the whole reply, so --timeout
+        can go past the tunnel's limit and a long answer still arrives.
+        """
+        text, finish, usage = [], None, {}
+        try:
+            async with self.client.stream(
+                    "POST", url, content=body, headers=self.headers,
+                    timeout=httpx.Timeout(timeout, connect=min(15.0, timeout))) as r:
+                if r.status_code != 200:
+                    detail = (await r.aread()).decode("utf-8", "replace")
+                    return self.http_failure(r.status_code, r.headers, detail)
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue                  # a comment or a keep-alive, not an event
+                    for choice in chunk.get("choices") or []:
+                        text.append((choice.get("delta") or {}).get("content") or "")
+                        finish = choice.get("finish_reason") or finish
+                    usage = chunk.get("usage") or usage
+        except httpx.TransportError as e:
+            return self.transport_failure(e)
+        return "ok", {"choices": [{"index": 0, "finish_reason": finish,
+                                   "message": {"role": "assistant",
+                                               "content": "".join(text)}}],
+                      "usage": usage}
 
     async def poll_metrics(self) -> None:
         while not self.run.stopping:
@@ -1126,23 +1173,24 @@ class Endpoint:
 
         run = self.run
         contract = run.prompt["contract"]
-        order, label = contract["order"], contract["label"]
+        order, pinned = contract["order"], contract["canary_key"]
         payload = build_payload(
             self.model, run.prompt, run.render(run.canary_item), run.decoding, self.extra,
             schema=canary_schema(contract) if run.guided else None,
-            name="canary", guided=run.guided, drop=self.drop)
+            name="canary", guided=run.guided, drop=self.drop, stream=self.stream)
         kind, r = await self.call("POST", self.chat_path, json.dumps(payload).encode(),
-                                  run.args.timeout)
+                                  run.args.timeout, stream=self.stream)
         if kind == "auth":
             self.reload_env()
             kind, r = await self.call("POST", self.chat_path,
-                                      json.dumps(payload).encode(), run.args.timeout)
+                                      json.dumps(payload).encode(), run.args.timeout,
+                                      stream=self.stream)
         if kind == "bad_request":
             return self.refuse(f"canary request rejected: {r}")
         if kind != "ok":
             return self.set_down(f"canary: {r}")
         try:
-            data = r.json()
+            data = r if isinstance(r, dict) else r.json()
             choice = data["choices"][0]
             content = choice["message"].get("content") or ""
         except (ValueError, KeyError, IndexError, TypeError):
@@ -1160,9 +1208,9 @@ class Endpoint:
             except ValueError:
                 return self.refuse(f"canary reply is not JSON, so response_format is not "
                                    f"enforced: {content[:120]!r}")
-            if not isinstance(obj, dict) or obj.get(label) != CANARY:
-                return self.refuse(f"server ignores response_format: canary {label} "
-                                   f"{obj.get(label) if isinstance(obj, dict) else obj!r}")
+            if not isinstance(obj, dict) or obj.get(pinned) != CANARY:
+                return self.refuse(f"server ignores response_format: canary {pinned} "
+                                   f"{obj.get(pinned) if isinstance(obj, dict) else obj!r}")
             if tuple(obj) != tuple(order):
                 return self.refuse(f"server does not enforce key order: got {list(obj)}, "
                                    f"schema {list(order)}")
@@ -1234,10 +1282,6 @@ class Endpoint:
                 seen, delay = self.api, args.probe_min
             elif time.monotonic() - last < delay:
                 continue
-            if self.quota_limit and self.run.quota.used(self.account) >= self.quota_limit:
-                self.state = "quota"
-                self.event(f"QUOTA: account {self.account} reached {self.quota_limit}")
-                return
             last = time.monotonic()
             if await self.preflight() != "down":
                 return
@@ -1252,18 +1296,18 @@ class Endpoint:
 class Run:
     def __init__(self, args, prompt: dict, decoding: dict, meta: dict, out: str,
                  items_by_ep: dict[str, list[Item]], shared: bool,
-                 endpoint_cfgs: list[dict], quota: Quota, done: set[str],
-                 canary_item: Item):
+                 endpoint_cfgs: list[dict], done: set[str], canary_item: Item):
         self.args, self.prompt, self.decoding, self.meta, self.out = (
             args, prompt, decoding, meta, out)
         self.guided = args.guided == "on"
-        self.quota = quota
         self.done = done
         self.canary_item = canary_item
         self.shared = shared
         self.session = now_iso()
         self.stopping = False
         self.stop_reason = ""
+        self.requests = 0
+        self.max_requests = int(args.max_requests or 0)
         self.finished: asyncio.Event | None = None
         self.sleeping = 0
         self.lines = 0
@@ -1288,10 +1332,21 @@ class Run:
     def queues(self) -> list[collections.deque]:
         seen, out = set(), []
         for ep in self.endpoints:
-            if id(ep.queue) not in seen and (self.shared or ep.state not in ("refused", "quota")):
+            if id(ep.queue) not in seen and (self.shared or ep.state != "refused"):
                 seen.add(id(ep.queue))
                 out.append(ep.queue)
         return out
+
+    def spend_one(self) -> tuple[str, str] | None:
+        """The run's request ceiling. Every request passes through here -- rows, preflight
+        and probes alike -- because a ceiling that counted only rows would not be one.
+        Reaching it stops the run the way Ctrl-C does: the requests in flight finish, the
+        summary is written, and the rows never sent are reported as missing."""
+        if self.max_requests and self.requests >= self.max_requests:
+            self.stop(f"--max-requests {self.max_requests} reached")
+            return "limit", f"the run's ceiling of {self.max_requests} requests"
+        self.requests += 1
+        return None
 
     def remaining(self) -> int:
         return (sum(len(q) for q in self.queues()) + sum(ep.inflight for ep in self.endpoints)
@@ -1345,9 +1400,10 @@ class Run:
         t0 = time.monotonic()
         try:
             body = json.dumps(build_payload(ep.model, self.prompt, self.render(it),
-                                            self.decoding, ep.extra,
-                                            guided=self.guided, drop=ep.drop)).encode()
-            kind, r = await ep.call("POST", ep.chat_path, body, self.args.timeout)
+                                            self.decoding, ep.extra, guided=self.guided,
+                                            drop=ep.drop, stream=ep.stream)).encode()
+            kind, r = await ep.call("POST", ep.chat_path, body, self.args.timeout,
+                                    stream=ep.stream)
         except Exception as e:
             # Rendering and serialising happen here, so a bug in either used to kill the
             # task before the in-flight slot was returned: remaining() then never reached
@@ -1362,7 +1418,7 @@ class Run:
 
         if kind == "ok":
             try:
-                data = r.json()
+                data = r if isinstance(r, dict) else r.json()
                 choice = data["choices"][0]
                 content = choice["message"].get("content") or ""
                 usage = data.get("usage") or {}
@@ -1401,11 +1457,8 @@ class Run:
             q.appendleft(it)
             ep.mark_down(str(r))
             return
-        if kind == "quota":
-            q.appendleft(it)
-            if ep.state == "up":
-                ep.state = "quota"
-                ep.event(f"QUOTA: {r}")
+        if kind == "limit":
+            q.appendleft(it)              # the run is already stopping; keep the row unsent
             return
         if kind == "auth":
             q.appendleft(it)
@@ -1470,7 +1523,7 @@ class Run:
             if self.remaining() == 0 and all(ep.state != "starting" for ep in self.endpoints):
                 self.stop("queue drained")
                 break
-            live = [ep for ep in self.endpoints if ep.state not in ("refused", "quota")
+            live = [ep for ep in self.endpoints if ep.state != "refused"
                     and (ep.queue or ep.inflight or self.sleeping)]
             if not live:
                 states = ", ".join(f"{ep.name}={ep.state}" for ep in self.endpoints)
@@ -1511,16 +1564,14 @@ class Run:
         log(f"{done:,}/{len(self.planned):,} rows | " + " | ".join(parts) + f" | ETA {eta}")
 
     def write_endpoints(self) -> None:
-        self.quota.flush()
         write_json(os.path.join(self.out, "endpoints.json"), {
-            "session": self.session, "updated": now_iso(), "quota_file": rel(self.quota.path),
+            "session": self.session, "updated": now_iso(),
+            "requests": self.requests, "max_requests": self.max_requests or None,
             "endpoints": [{
                 "name": ep.name, "env_file": ep.cfg.get("env_file", ".env"),
                 "url_key": ep.cfg["url_key"], "auth_key": ep.cfg.get("auth_key") or None,
                 "model": ep.model, "served": ep.served, "state": ep.state,
-                "api": ep.api, "chat_path": ep.chat_path,
-                "account": ep.account, "quota": ep.quota_limit,
-                "quota_used_this_month": self.quota.used(ep.account),
+                "api": ep.api, "chat_path": ep.chat_path, "stream": ep.stream,
                 "requests_this_session": ep.stats["requests"], "rows_this_session": ep.stats["rows"],
                 "window": ep.tuner.limit, "window_bounds": [ep.tuner.lo, ep.tuner.hi],
                 "errors": dict(ep.errors), "extra": ep.extra or None,
@@ -1543,7 +1594,6 @@ class Run:
                 log("second interrupt: exiting now")
                 self.out_f.flush()
                 os.fsync(self.out_f.fileno())
-                self.quota.flush()
                 os._exit(130)
             self.stop("interrupted; waiting for in-flight requests (interrupt again to exit)")
 
@@ -1591,7 +1641,6 @@ class Run:
             self.out_f.flush()
             os.fsync(self.out_f.fileno())
             self.out_f.close()
-            self.quota.flush()
             self.write_endpoints()
         s = self.write_summary()
         log(f"wrote {self.written:,} rows this session; {s['missing']:,} of {s['planned']:,} "
@@ -1655,7 +1704,7 @@ def cli_endpoint(args) -> list[dict]:
     return [cfg]
 
 
-def load_endpoints(path: str, only: list[str]) -> tuple[list[dict], str]:
+def load_endpoints(path: str, only: list[str]) -> list[dict]:
     try:
         with open(path, "rb") as f:
             cfg = tomllib.load(f)
@@ -1675,7 +1724,7 @@ def load_endpoints(path: str, only: list[str]) -> tuple[list[dict], str]:
         missing = [k for k in ("name", "url_key", "model") if not e.get(k)]
         if missing:
             raise ConfigError(f"{path}: endpoint {e.get('name')!r} lacks {missing}")
-    return eps, resolve(cfg.get("quota_file", "runs/quota.json"))
+    return eps
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -1725,6 +1774,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--chat-path", metavar="PATH",
                     help="the path appended to the base URL, default /chat/completions. "
                          "/messages for Anthropic")
+    ap.add_argument("--stream", action="store_true",
+                    help="read replies as server-sent events instead of waiting for the "
+                         "whole body. Behind a tunnel that cuts a silent request (a "
+                         "Cloudflare 524 at ~100 s) this is what lets a slow reply finish, "
+                         "and --timeout then measures silence rather than the whole reply. "
+                         "Per endpoint: stream = true")
+    ap.add_argument("--max-requests", type=int, default=0, metavar="N",
+                    help="stop the run after N requests: the ceiling that keeps a typo "
+                         "from judging 55,000 rows against a paid API. Rows, preflight "
+                         "and probes all count. The run stops the way Ctrl-C stops it, so "
+                         "the rows already answered are on disk and a re-run resumes")
     ap.add_argument("--skip-model-check", action="store_true",
                     help="do not ask /models whether the model is served, for an API that "
                          "has none or that lists deployment names. The canary still has to "
@@ -1874,7 +1934,6 @@ def run_main(args: argparse.Namespace) -> int:
                # max_tokens may be raised between sessions to recover truncated rows.
                "decoding": decoding}
     os.makedirs(out, exist_ok=True)
-    check_run_json(out, meta, session)
     order_path = os.path.join(out, "order.csv")
     with open(order_path + ".tmp", "w", encoding="utf-8", newline="") as f:
         f.write(order_csv)
@@ -1884,9 +1943,11 @@ def run_main(args: argparse.Namespace) -> int:
     log(f"items {rel(items_path)}: {len(items):,} rows -> {rel(order_path)}")
     for (g, st), c in sorted(counts.items()):
         log(f"  {g or '-':<9} {st or '-':<28} {c:>6}")
-    log(f"prompt {prompt['name']}: answers {list(prompt['order'])}, {prompt['label']} one "
-        f"of {prompt['values']}, guided decoding "
-        f"{'on' if guided else 'off'}, max_tokens {args.max_tokens}, prompt sha "
+    counted = (f"{prompt['label']} one of {prompt['values']}" if prompt["label"] else
+               "no key offers a choice, so nothing is counted and the canary pins "
+               f"{prompt['contract']['canary_key']!r}")
+    log(f"prompt {prompt['name']}: answers {list(prompt['order'])}, {counted}, guided "
+        f"decoding {'on' if guided else 'off'}, max_tokens {args.max_tokens}, prompt sha "
         f"{prompt['prompt_sha'][:16]}, schema sha {prompt['schema_sha'][:16]}")
 
     user_text = render_user(prompt["user"], items[0].fields)
@@ -1895,22 +1956,27 @@ def run_main(args: argparse.Namespace) -> int:
     write_json(os.path.join(out, "request_example.json"),
                build_payload(args.model or "<model from the endpoints file>", prompt,
                              user_text, decoding, args.extra, guided=guided,
-                             drop=args.drop))
+                             drop=args.drop, stream=args.stream))
     if args.dry_run:
-        log(f"dry run: no calls. Wrote order.csv, run.json, prompt_example.txt, "
+        # run.json is deliberately not written. It pins the prompt and the decoding for
+        # every later session, and a dry run sends nothing and records nothing, so there
+        # is no results.jsonl for it to protect yet. Written here, it locked the directory
+        # to the prompt you were only trying out: the second --dry-run with a different
+        # prompt was refused and you had to delete the directory to look at another one.
+        log(f"dry run: no calls, and no run.json. Wrote order.csv, prompt_example.txt, "
             f"request_example.json in {rel(out)}")
         return EXIT_OK
+
+    check_run_json(out, meta, session)
 
     if (args.base_url or args.model) and (args.endpoint or
                                           args.endpoints != ENDPOINTS_DEFAULT):
         raise ConfigError("--base-url/--model describe one endpoint instead of an "
                           "endpoints file; giving both would silently ignore the file")
     if args.base_url or args.model:
-        # One endpoint and one run, so there is nothing to share: the request count goes
-        # beside the results rather than into a file somewhere up the tree.
-        ep_cfgs, quota_file = cli_endpoint(args), os.path.join(out, "quota.json")
+        ep_cfgs = cli_endpoint(args)
     else:
-        ep_cfgs, quota_file = load_endpoints(resolve(args.endpoints), args.endpoint)
+        ep_cfgs = load_endpoints(resolve(args.endpoints), args.endpoint)
     if args.mode == "shard" and len({e["model"] for e in ep_cfgs}) > 1:
         raise ConfigError(f"shard mode needs one model on every endpoint, got "
                           f"{sorted({e['model'] for e in ep_cfgs})}; use --mode compare")
@@ -1938,7 +2004,7 @@ def run_main(args: argparse.Namespace) -> int:
             by_ep[e["name"]] = [it for it in its if it.key not in skip]
 
     run = Run(args, prompt, decoding, meta, out, by_ep, args.mode == "shard",
-              ep_cfgs, Quota(quota_file), done=skip & planned_keys, canary_item=items[0])
+              ep_cfgs, done=skip & planned_keys, canary_item=items[0])
     run.planned = planned_keys
 
     pid_path = os.path.join(out, "judge.pid")

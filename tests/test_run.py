@@ -1,8 +1,8 @@
 """llmjudge/run.py against a threaded mock vLLM server.
 
 Covers what the stream runs got wrong: a slow row must not hold the others, an endpoint
-that dies mid-run must lose and duplicate nothing, a restart must resume, the request
-quota must stop an account, and a server that ignores the schema must be refused. The
+that dies mid-run must lose and duplicate nothing, a restart must resume, --max-requests
+must stop the run, and a server that ignores the schema must be refused. The
 mock's verdicts are a fixed rule; nothing here says anything about a real model.
 
     python3 -m unittest tests.test_run             (from the repository root)
@@ -81,6 +81,24 @@ def make_handler(state: MockState):
             self.end_headers()
             self.wfile.write(body)
 
+        def _sse(self, content, usage):
+            """The reply split across events, so the judge has to assemble it."""
+            cut = len(content) // 2
+            events = [
+                {"choices": [{"index": 0, "delta": {"content": content[:cut]},
+                              "finish_reason": None}]},
+                {"choices": [{"index": 0, "delta": {"content": content[cut:]},
+                              "finish_reason": "stop"}]},
+                {"choices": [], "usage": usage},
+            ]
+            body = ("".join(f"data: {json.dumps(e)}\n\n" for e in events)
+                    + "data: [DONE]\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             if state.dead:
                 self.close_connection = True
@@ -125,10 +143,13 @@ def make_handler(state: MockState):
                         else "consistent")
                     values = {"verdict": verdict, "short_reason": "no conflict"}
                     obj = {k: values[k] for k in schema["properties"]}
+                usage = {"prompt_tokens": len(user) // 4, "completion_tokens": 12}
+                if req.get("stream"):
+                    return self._sse(json.dumps(obj), usage)
                 self._json(200, {
                     "choices": [{"index": 0, "finish_reason": "stop",
                                  "message": {"role": "assistant", "content": json.dumps(obj)}}],
-                    "usage": {"prompt_tokens": len(user) // 4, "completion_tokens": 12}})
+                    "usage": usage})
             finally:
                 with state.lock:
                     state.concurrent -= 1
@@ -198,17 +219,17 @@ def write_items(root: str) -> str:
     return path
 
 
-def write_endpoints(root: str, port: int, quota: int = 0, concurrency: int = 4,
+def write_endpoints(root: str, port: int, concurrency: int = 4,
                     max_concurrency: int = 16) -> str:
     env = os.path.join(root, ".env")
     with open(env, "w") as f:
         f.write(f"MOCK_URL=http://127.0.0.1:{port}/v1\n")
     path = os.path.join(root, "endpoints.toml")
     with open(path, "w") as f:
-        f.write(f'quota_file = "{root}/quota.json"\n\n[[endpoint]]\nname = "mock"\n'
+        f.write(f'[[endpoint]]\nname = "mock"\n'
                 f'env_file = "{env}"\nurl_key = "MOCK_URL"\nmodel = "{MODEL}"\n'
                 f"concurrency = {concurrency}\nmin_concurrency = 1\n"
-                f'max_concurrency = {max_concurrency}\naccount = "acct"\nquota = {quota}\n')
+                f"max_concurrency = {max_concurrency}\n")
     return path
 
 
@@ -260,10 +281,35 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(items["properties"]["columns"], {"type": "array",
                                                           "items": {"type": "string"}})
 
-    def test_a_prompt_with_no_choices_is_refused(self):
+    def test_a_prompt_with_no_choices_runs_and_counts_nothing(self):
+        """An answer that is prose, or a free number, is recorded like any other; there is
+        just nothing to count, and the canary pins the first key instead."""
+        c = cj.read_contract('Answer:\n{"why": "<one sentence>", "minutes": 12}')
+        self.assertEqual((c["label"], c["values"], c["canary_key"]), (None, [], "why"))
+        ok = cj.parse_strict('{"why": "late triage", "minutes": 40}', c)
+        self.assertEqual((ok["verdict"], ok["answer"]["minutes"]), (None, 40))
+        self.assertIn("parse_error", cj.parse_strict('{"why": "x"}', c))
+        self.assertEqual(cj.canary_schema(c)["properties"]["why"],
+                         {"type": "string", "enum": [cj.CANARY]})
+        tol = cj.parse_tolerant('thinking...\n{"why": "x", "minutes": 1}', c)
+        self.assertEqual((tol["verdict"], tol["reasoning"]), (None, "thinking..."))
+
+    def test_the_contract_is_fenced_when_the_prompt_shows_other_examples(self):
+        """Few-shot examples are between the prompt and the model. The judge needs to be
+        told which object is the answer it must demand."""
+        with_icl = ('Here is a good answer:\n{"verdict": "consistent", "why": "ok"}\n'
+                    'and a bad one:\n{"verdict": "nope"}\n')
         with self.assertRaises(cj.ConfigError) as cm:
-            cj.read_contract('Answer:\n{"why": "<one sentence>"}')
-        self.assertIn("must list the values it may take", str(cm.exception))
+            cj.read_contract(with_icl + 'Answer:\n{"verdict": "a" | "b", "why": "<15 words>"}')
+        self.assertIn("```answer", str(cm.exception))
+        c = cj.read_contract(with_icl + 'Answer:\n```answer\n'
+                             '{"verdict": "a" | "b", "why": "<15 words>"}\n```')
+        self.assertEqual((c["order"], c["values"]), (("verdict", "why"), ["a", "b"]))
+
+    def test_a_prompt_with_no_json_at_all_is_refused(self):
+        with self.assertRaises(cj.ConfigError) as cm:
+            cj.read_contract("Say whether the record is consistent.")
+        self.assertIn("found none", str(cm.exception))
 
 
 class PromptTests(unittest.TestCase):
@@ -467,8 +513,8 @@ class RunTests(RunBase):
             paths.append(os.path.join(self.root, name))
             with open(paths[-1], "w") as f:
                 f.write(text)
-        self.assertEqual(self.judge("--dry-run", "--system", paths[0], "--user", paths[1],
-                                    "--prompt-name", "mine"), cj.EXIT_OK)
+        self.assertEqual(self.judge("--limit", "2", "--system", paths[0], "--user",
+                                    paths[1], "--prompt-name", "mine"), cj.EXIT_OK)
         with open(os.path.join(self.out, "run.json")) as f:
             meta = json.load(f)
         self.assertEqual((meta["prompt"], meta["prompt_dir"]), ("mine", None))
@@ -573,14 +619,15 @@ class RunTests(RunBase):
         self.assert_one_record_per_row()
         self.assertEqual(sum(bool(r["error"]) for r in self.results), 1)      # only row 5
 
-    def test_quota_stops_the_account(self):
-        endpoints = write_endpoints(self.root, self.server.port, quota=10, concurrency=1,
+    def test_max_requests_stops_the_run(self):
+        """The ceiling counts everything the run sends, so it really is a ceiling."""
+        endpoints = write_endpoints(self.root, self.server.port, concurrency=1,
                                     max_concurrency=1)
-        self.assertEqual(self.judge(endpoints=endpoints), cj.EXIT_INCOMPLETE)
-        with open(os.path.join(self.root, "quota.json")) as f:
-            used = sum(json.load(f).values())
-        self.assertEqual(used, 10)
+        self.assertEqual(self.judge("--max-requests", "10", endpoints=endpoints),
+                         cj.EXIT_INCOMPLETE)
         self.assertEqual(len(self.results), 8)      # 10 minus /v1/models and the canary
+        with open(os.path.join(self.out, "endpoints.json")) as f:
+            self.assertEqual(json.load(f)["requests"], 10)
 
     def test_server_ignoring_the_schema_is_refused(self):
         self.state.ignore_schema = True
@@ -736,7 +783,36 @@ class ApiShapeTests(RunBase):
         self.assertEqual(len(self.results), 2)
 
 
+class StreamTests(RunBase):
+    def test_a_streamed_run_assembles_the_same_answers(self):
+        """Behind a tunnel that cuts a silent request, streaming is what lets a slow reply
+        finish. The verdicts, the token counts and the finish reason must not change."""
+        self.assertEqual(self.judge("--stream"), cj.EXIT_OK)
+        self.assert_one_record_per_row()
+        self.assertTrue(self.state.last_body.get("stream"))
+        self.assertEqual(self.state.last_body.get("stream_options"),
+                         {"include_usage": True})
+        judged = [r for r in self.results if r.get("verdict")]
+        self.assertEqual(len(judged), POOL_ROWS - 1)        # the one row the server 400s
+        self.assertTrue(all(r["verdict"] in ("consistent", "inconsistent") for r in judged))
+        self.assertTrue(all(r["completion_tokens"] == 12 for r in judged))
+        self.assertTrue(all(r["finish_reason"] == "stop" for r in judged))
+
+    def test_streaming_is_off_unless_asked_for(self):
+        self.assertEqual(self.judge("--limit", "2"), cj.EXIT_OK)
+        self.assertNotIn("stream", self.state.last_body)
+
+
 class ResumeSettingsTests(RunBase):
+    def test_max_requests_covers_the_base_url_path_too(self):
+        """A paid API reached with --base-url has no endpoints file, so this flag is the
+        only ceiling between a typo and a very large bill."""
+        rc = self.cli("--prompt", "c2", "--base-url", self.url(), "--model", MODEL,
+                      "--max-requests", "6")
+        self.assertEqual(rc, cj.EXIT_INCOMPLETE)          # stopped, not failed
+        self.assertLessEqual(self.state.chat_calls, 6)
+        self.assertLess(len(self.results), POOL_ROWS)
+
     def test_a_raised_max_tokens_resumes_but_a_changed_temperature_does_not(self):
         """A truncated reply is an error, never a verdict, so raising the budget to
         recover those rows must not cost the rows already judged."""
@@ -748,6 +824,17 @@ class ResumeSettingsTests(RunBase):
         self.assertEqual(meta["decoding"]["max_tokens"], 2048)        # restated
         self.assertEqual([s["decoding"]["max_tokens"] for s in meta["sessions"]], [96, 2048])
         self.assertEqual(self.judge("--temperature", "0.7"), cj.EXIT_CONFIG)
+
+    def test_a_dry_run_does_not_pin_the_directory(self):
+        """A dry run sends nothing and records nothing, so trying a second prompt in the
+        same directory must not be refused -- that is what a dry run is for."""
+        self.assertEqual(self.judge("--dry-run", prompt="c2"), cj.EXIT_OK)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "run.json")))
+        self.assertEqual(self.judge("--dry-run", prompt="c3"), cj.EXIT_OK)
+        self.assertEqual(self.judge("--limit", "2", prompt="c3"), cj.EXIT_OK)
+        with open(os.path.join(self.out, "run.json")) as f:
+            self.assertEqual(json.load(f)["prompt"], "c3")   # pinned by the real run
+        self.assertEqual(self.judge("--limit", "2", prompt="c2"), cj.EXIT_CONFIG)
 
     def test_a_run_with_no_prompt_is_refused_and_says_what_there_is(self):
         rc = self.cli("--base-url", self.url(), "--model", MODEL)
@@ -764,11 +851,10 @@ class HotSwapTests(RunBase):
             f.write(f"MOCK_URL=http://127.0.0.1:{port_a}/v1\n")
         path = os.path.join(self.root, "endpoints.toml")
         with open(path, "w") as f:
-            f.write(f'quota_file = "{self.root}/quota.json"\n')
             for name, key in (("a", "MOCK_URL"), ("b", "MOCK_URL_2")):
                 f.write(f'\n[[endpoint]]\nname = "{name}"\nenv_file = "{env}"\n'
                         f'url_key = "{key}"\nmodel = "{MODEL}"\nconcurrency = 2\n'
-                        f"min_concurrency = 1\nmax_concurrency = 2\nquota = 0\n")
+                        f"min_concurrency = 1\nmax_concurrency = 2\n")
         return env, path
 
     def wait_for_rows(self, n: int) -> None:

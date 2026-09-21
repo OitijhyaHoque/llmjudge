@@ -24,7 +24,7 @@ python3 -m pip install -e .                           # or: pip install -r requi
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 45 tests, ~30s, no server needed
+python3 -m unittest discover -s tests -t .            # 51 tests, ~33s, no server needed
 llmjudge --items items.jsonl --out out/pilot \
     --prompt c3 --run-tag pilot-01 --dry-run
 ```
@@ -44,7 +44,8 @@ path — items, out, endpoints, `.env` — is yours, and is read relative to the
 run in. `python3 -m llmjudge` is the same entry point as the `llmjudge` command.
 
 `--dry-run` renders the first prompt, prints it, and sends nothing. Always the first step
-against a new prompt or a new endpoint.
+against a new prompt or a new endpoint. It writes no `run.json`, so you can dry-run one
+prompt after another into the same directory and compare them.
 
 ## Saying where the model is
 
@@ -63,6 +64,26 @@ Several servers — two notebooks sharing a pool, or MedGemma against a frontier
 configs/endpoints.example.toml configs/endpoints.toml`. An entry names the *environment
 variables* holding its URL and key, never the values. Those are read from the entry's
 `env_file` if there is one, and from the process environment otherwise.
+
+### Slow replies, and a ceiling on the bill
+
+```bash
+llmjudge --stream                 # read the reply as it is written
+llmjudge --max-requests 2000      # and stop the run there
+```
+
+Cloudflare cuts a request whose origin has sent nothing for about 100 s, which is why
+`--timeout` defaults to 95. A prompt that reasons before it answers can spend longer than
+that on a reply the server is still buffering, and the tunnel kills a row the model is
+still working on. `--stream` reads the reply as server-sent events, so the timeout measures
+*silence* instead of the whole reply and `--timeout` can go well past the tunnel's limit.
+The assembled answer, its token counts and its finish reason are the same either way. Off
+by default; `stream = true` sets it for one endpoint.
+
+`--max-requests` stops the run after N requests. It is the only thing between a typo and
+55,000 rows against a frontier model, so it counts everything the run sends: rows,
+preflight and probes. The stop is the Ctrl-C stop — requests in flight finish, the summary
+is written, and the answers already on disk stay, so a re-run picks up where it left off.
 
 ### When the API is not shaped like vLLM
 
@@ -157,10 +178,10 @@ it, and re-running the same cell resumes rather than starts again.
 
 ### The answer shape comes from your prompt
 
-One rule, and it is the only one: the system prompt shows **one JSON example of the
-answer**, on its own line or lines, starting with `{`. That example *is* the contract —
-the judge reads the keys, their order, and the values each may take out of it, and knows
-nothing else about your answer.
+One rule, and it is the only one: the system prompt shows the **answer as a JSON example**,
+on its own line or lines, starting with `{`. That example *is* the contract — the judge
+reads the keys, their order, and the values each may take out of it, and knows nothing else
+about your answer.
 
 ```
 {"score": 1 | 2 | 3 | 4 | 5, "why": "<one sentence>"}
@@ -174,9 +195,30 @@ nothing else about your answer.
 - Nesting works: objects, and arrays whose one shown element describes the rest.
 - The key order is the schema's order, so a prompt that tells the model to reason before
   answering actually gets that under guided decoding.
-- **One key must offer a choice.** That key is the label: the thing `summary.json` counts,
-  the agreement check compares in `--mode compare`, and the canary pins when it checks
-  that your server really enforces `response_format`. It can be called anything.
+- **A key that offers a choice is the label**: the thing `summary.json` counts, the
+  agreement check compares in `--mode compare`, and the canary pins when it checks that
+  your server really enforces `response_format`. It can be called anything, and the first
+  one wins if there are several. A prompt need not have one — an answer that is prose, or
+  a free number, is recorded whole like any other; there is then nothing to count, so the
+  summary reports how many rows were answered and leaves the rates out, and the canary
+  pins the first key instead.
+
+**Showing the model other examples.** Few-shot examples are between your prompt and the
+model, and the judge has no business reading them — but it cannot tell which object is the
+contract either. So when the system prompt holds more than one JSON object, fence the one
+that is the contract, and write as many others as you like:
+
+````
+Here is a good answer:
+{"verdict": "consistent", "short_reason": "no conflict"}
+...and a bad one:
+{"verdict": "consistent", "short_reason": "the patient is male and 40 weeks pregnant"}
+
+Answer with this object and nothing else:
+```answer
+{"verdict": "consistent" | "inconsistent" | "unsure", "short_reason": "<25 words>"}
+```
+````
 
 The user template is free too: any `{column}` in it is filled from the item's `fields`,
 and every row is checked for every column before the run starts.
@@ -237,8 +279,8 @@ latest record is an error.
 not the items file. Append 2,000 rows to the file, re-run into the same directory, and
 only the new ids are sent. `run.json` restates which pool each session ran.
 
-**Refusal on a changed run.** `<out>/run.json` pins the prompt, the schema, the sampling
-settings, the send-order seed and the mode. A restart into that directory with any of them
+**Refusal on a changed run.** The first real run writes `<out>/run.json`, which pins the
+prompt, the schema, the sampling settings, the send-order seed and the mode. A restart into that directory with any of them
 changed is refused rather than quietly mixing two kinds of answer in one file.
 
 `--max-tokens` is the one setting you may change. A reply cut off at the budget is recorded
