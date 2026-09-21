@@ -1,0 +1,27 @@
+# Packaging exists for one reason: Colab installs the judge straight from GitHub,
+#
+#     pip install "git+https://<token>@github.com/<org>/llmjudge.git@v0.1.0"
+#
+# and then runs `llmjudge --items ... --out ...` or `python3 -m llmjudge`. The prompts live
+# inside the package (llmjudge/prompts/) so that they are installed with it; a top-level
+# directory would be left behind by pip and `--prompt c3` would find nothing.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmjudge"
+version = "0.1.0"
+description = "An LLM judge: items JSONL in, verdicts JSONL out. No rules, no cards, no dataset."
+requires-python = ">=3.11"          # tomllib
+dependencies = ["httpx>=0.27"]
+
+[project.scripts]
+llmjudge = "llmjudge.run:main"
+
+[tool.setuptools]
+packages = ["llmjudge"]
+
+[tool.setuptools.package-data]
+llmjudge = ["prompts/*/*.md"]

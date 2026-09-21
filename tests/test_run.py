@@ -30,7 +30,7 @@ sys.path.insert(0, ROOT)
 from llmjudge import run as cj  # noqa: E402
 
 MODEL = "mock/medgemma"
-with open(os.path.join(ROOT, "prompts", "c2", "user.md"), encoding="utf-8") as _f:
+with open(os.path.join(ROOT, "llmjudge", "prompts", "c2", "user.md"), encoding="utf-8") as _f:
     COLUMNS = re.findall(r"\{([^{}\s]+)\}", _f.read())
 
 # The items file stands in for whatever a caller's rule stage produced. Its group and
@@ -239,7 +239,7 @@ class PromptTests(unittest.TestCase):
 
     def test_first_instruction_contradicting_the_example_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(ROOT, "prompts", "c2", "system.md")) as f:
+            with open(os.path.join(ROOT, "llmjudge", "prompts", "c2", "system.md")) as f:
                 system = f.read().replace('write "verdict" FIRST', 'write "short_reason" FIRST')
             for name, text in (("system.md", system), ("user.md", "{label}")):
                 with open(os.path.join(d, name), "w") as f:
@@ -289,6 +289,27 @@ class ItemsTests(unittest.TestCase):
                 with self.assertRaises(cj.ConfigError) as cm:
                     cj.load_items(self._write(d, *lines), 42)
                 self.assertIn(expected, str(cm.exception))
+
+    def test_every_row_is_checked_against_the_prompt_columns(self):
+        """Not only the first one: the row that cannot be rendered used to be found
+        mid-run, with the model already warm."""
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(
+                d,
+                json.dumps({"id": "a", "fields": {"age": "1", "gender": "F"}}),
+                json.dumps({"id": "b", "fields": {"age": "2"}}),          # no gender
+            )
+            with self.assertRaises(cj.ConfigError) as cm:
+                cj.load_items(path, 42, ("age", "gender"))
+            self.assertIn("'b' lacks the fields", str(cm.exception))
+            self.assertIn("gender", str(cm.exception))
+            self.assertEqual(len(cj.load_items(path, 42, ("age",))[0]), 2)
+
+    def test_a_number_is_a_field_value_like_any_other(self):
+        """`{"age": 70}` is valid JSON and a caller will write it sooner or later."""
+        self.assertEqual(cj.render_user("age: {age}, n: {n}, x: {x}",
+                                        {"age": 70, "n": 5.0, "x": None}),
+                         "age: 70, n: 5, x: <missing>")
 
     def test_missing_items_file(self):
         with self.assertRaises(cj.ConfigError):
@@ -372,6 +393,41 @@ class RunTests(RunBase):
             summary = json.load(f)
         self.assertEqual((summary["rows"], summary["missing"]), (POOL_ROWS, 0))
         self.assertFalse(os.path.exists(os.path.join(self.out, "judge.pid")))
+
+    def test_an_unrenderable_row_is_recorded_and_does_not_hang(self):
+        """Rendering happens inside the request task. When it raised, the in-flight slot
+        was never returned, remaining() never reached zero, and the run sat at 85/86
+        forever. Any bug in there must cost one row, not the run."""
+        doomed = cj.load_items(self.items, 42)[0][-1].id        # last in send order
+        with open(self.items, encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f]
+        for r in rows:
+            if r["id"] == doomed:
+                r["fields"]["diag_2"] = "EXPLODE"
+        with open(self.items, "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in rows)
+
+        real = cj.render_user
+
+        def boom(template, row):
+            if row.get("diag_2") == "EXPLODE":
+                raise ValueError("deliberate")
+            return real(template, row)
+
+        cj.render_user = boom
+        rc: list[int] = []
+        th = threading.Thread(target=lambda: rc.append(self.judge()), daemon=True)
+        try:
+            th.start()
+            th.join(60)
+        finally:
+            cj.render_user = real
+        self.assertFalse(th.is_alive(), "the run never finished")
+        self.assertEqual(rc, [cj.EXIT_OK])
+        self.assert_one_record_per_row()
+        internal = [r for r in self.results if (r["error"] or {}).get("class") == "internal"]
+        self.assertEqual([r["id"] for r in internal], [doomed])
+        self.assertIn("ValueError", internal[0]["error"]["detail"])
 
     def test_slow_rows_do_not_hold_the_others(self):
         self.state.delay, self.state.slow_seconds = 0.02, 1.5

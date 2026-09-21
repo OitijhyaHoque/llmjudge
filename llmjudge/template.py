@@ -13,8 +13,10 @@ PLACEHOLDER = re.compile(r"\{([^{}\s]+)\}")
 INTEGRAL_FLOAT = re.compile(r"^-?\d+\.0+$")
 
 
-def render_value(v: str | None) -> str:
-    v = (v or "").strip()
+def render_value(v) -> str:
+    """Any JSON scalar, not only a string: an items file may hold `{"age": 70}`, and a
+    number that reaches the model as a crash instead of "70" is the worst of both."""
+    v = "" if v is None else str(v).strip()
     if not v:
         return "<missing>"
     return v.split(".")[0] if INTEGRAL_FLOAT.match(v) else v   # "63.0" -> "63", lossless

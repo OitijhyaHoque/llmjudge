@@ -38,7 +38,7 @@ Throughput
     rest keep flowing; vLLM batches whatever is in flight on its side. The window adapts:
     it grows (+25%) while measured throughput keeps rising, steps back when a step bought
     nothing (the server is saturated), and halves on 429s and timeouts. Bounds come from
-    `configs/c2_endpoints.toml`. With `metrics = true` it also stops growing while vLLM
+    `configs/endpoints.toml`. With `metrics = true` it also stops growing while vLLM
     reports queued requests; that is off by default, because every poll through ngrok
     counts against the monthly request quota.
 
@@ -146,9 +146,9 @@ import tomllib
 import httpx
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+PROMPTS = os.path.join(HERE, "prompts")        # ships with the package, so pip install works
 
-from .prompts import PLACEHOLDER, render_user
+from .template import PLACEHOLDER, render_user
 
 VERDICTS = ("consistent", "inconsistent", "unsure")
 KEYS = ("verdict", "short_reason")
@@ -193,16 +193,20 @@ def file_sha(path: str) -> str:
 
 
 def resolve(path: str) -> str:
-    """Relative paths are relative to the repository root, wherever this is started from."""
-    return path if os.path.isabs(path) else os.path.normpath(os.path.join(ROOT, path))
+    """Relative paths are relative to the working directory, like every other CLI.
+
+    They used to be relative to the repository root, which is wrong the moment the package
+    is pip-installed: the root is then site-packages, and `--items items.jsonl` looks for
+    the pool inside the installation."""
+    return os.path.abspath(os.path.expanduser(path))
 
 
 def rel(path: str) -> str:
-    """Repo-relative when the path is inside the repo, absolute otherwise.
+    """Relative to the working directory when it is below it, absolute otherwise.
 
-    Items and results usually live outside the checkout -- on Drive, or on a share -- and
+    Items and results usually live elsewhere -- on Drive, or on a share -- and
     `../../../../mnt/...` in run.json helps nobody reading it later."""
-    r = os.path.relpath(path, ROOT)
+    r = os.path.relpath(path, os.getcwd())
     return path if r.startswith("..") else r
 
 
@@ -247,7 +251,7 @@ def read_env(path: str) -> dict[str, str]:
 
 
 def load_prompt(arg: str) -> dict:
-    d = resolve(arg if os.sep in arg else os.path.join("prompts", arg))
+    d = resolve(arg) if os.sep in arg else os.path.join(PROMPTS, arg)
     try:
         with open(os.path.join(d, "system.md"), encoding="utf-8") as f:
             system = f.read().strip()
@@ -388,11 +392,14 @@ class Item:
         return Item(**{k: getattr(self, k) for k in self.__slots__ if k != "key"}, key=key)
 
 
-def load_items(path: str, seed: int) -> tuple[list[Item], str, str]:
+def load_items(path: str, seed: int, columns: tuple[str, ...] = ()) -> tuple[list[Item], str, str]:
     """-> (items in send order, sha of the items file, order.csv text).
 
     The file is read whole and checked whole before a single request goes out: a pool that
-    is malformed on line 40,000 should cost nothing, not four hours.
+    is malformed on line 40,000 should cost nothing, not four hours. `columns` are the
+    `{column}` placeholders the prompt names; every row must carry all of them, because a
+    row that cannot be rendered is discovered at render time, mid-run, with the model
+    already warm.
     """
     items: list[Item] = []
     seen: set[str] = set()
@@ -417,6 +424,10 @@ def load_items(path: str, seed: int) -> tuple[list[Item], str, str]:
                 fields = obj.get("fields")
                 if not isinstance(fields, dict):
                     raise ConfigError(f'{path}:{lineno}: "fields" must be an object')
+                absent = [c for c in columns if c not in fields]
+                if absent:
+                    raise ConfigError(f"{path}:{lineno}: item {item_id!r} lacks the fields "
+                                      f"the prompt names: {absent}")
                 weight = obj.get("weight", 1.0)
                 if not isinstance(weight, (int, float)) or isinstance(weight, bool):
                     raise ConfigError(f'{path}:{lineno}: "weight" must be a number')
@@ -1036,11 +1047,20 @@ class Run:
             q.appendleft(it)
 
     async def handle(self, ep: Endpoint, it: Item, q: collections.deque) -> None:
-        body = json.dumps(build_payload(ep.model, self.prompt, self.render(it), self.decoding,
-                                        ep.extra, guided=self.guided)).encode()
         t0 = time.monotonic()
         try:
+            body = json.dumps(build_payload(ep.model, self.prompt, self.render(it),
+                                            self.decoding, ep.extra,
+                                            guided=self.guided)).encode()
             kind, r = await ep.call("POST", "/chat/completions", body, self.args.timeout)
+        except Exception as e:
+            # Rendering and serialising happen here, so a bug in either used to kill the
+            # task before the in-flight slot was returned: remaining() then never reached
+            # zero and the run hung with rows left. Record the row and move on instead.
+            self.record(ep, it, None, {"latency_s": round(time.monotonic() - t0, 3)},
+                        error=("internal", f"{type(e).__name__}: {str(e)[:200]}"))
+            ep.errors["internal"] += 1
+            return
         finally:
             ep.inflight -= 1
         latency = round(time.monotonic() - t0, 3)
@@ -1364,10 +1384,8 @@ def run_main(args: argparse.Namespace) -> int:
     decoding = {"temperature": args.temperature, "seed": args.seed,
                 "max_tokens": args.max_tokens}
 
-    items, items_sha, order_csv = load_items(items_path, args.seed)
-    missing = [k for k in PLACEHOLDER.findall(prompt["user"]) if k not in items[0].fields]
-    if missing:
-        raise ConfigError(f"prompt {prompt['name']!r} needs fields the items lack: {missing}")
+    columns = tuple(dict.fromkeys(PLACEHOLDER.findall(prompt["user"])))
+    items, items_sha, order_csv = load_items(items_path, args.seed, columns)
     meta = {"prompt": prompt["name"], "prompt_dir": rel(prompt["dir"]),
             "prompt_sha": prompt["prompt_sha"], "key_order": list(prompt["order"]),
             "guided": guided,

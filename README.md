@@ -16,15 +16,30 @@ it unchanged.
 
 ## Quickstart
 
+From a checkout:
+
 ```bash
-python3 -m pip install -r requirements.txt
+python3 -m pip install -e .                           # or: pip install -r requirements.txt
 cp .env.example .env                                  # fill in the URL and key
 cp configs/endpoints.example.toml configs/endpoints.toml
 
-python3 -m unittest discover -s tests -t .            # 21 tests, ~18s, no server needed
-python3 -m llmjudge --items items.jsonl --out out/pilot \
+python3 -m unittest discover -s tests -t .            # 24 tests, ~18s, no server needed
+llmjudge --items items.jsonl --out out/pilot \
     --prompt c3 --run-tag pilot-01 --dry-run
 ```
+
+From anywhere else — a Colab notebook, a colleague's machine — install the tag instead,
+and nothing is checked out at all:
+
+```bash
+pip install "git+https://$GH_TOKEN@github.com/<org>/llmjudge.git@v0.1.0"
+llmjudge --items /content/drive/MyDrive/judge/items.jsonl --out results/pilot \
+    --prompt c3 --run-tag pilot-01 --endpoints my-endpoints.toml
+```
+
+The prompts ship inside the package, so `--prompt c3` works with no checkout. Every other
+path — items, out, endpoints, `.env` — is yours, and is read relative to the directory you
+run in. `python3 -m llmjudge` is the same entry point as the `llmjudge` command.
 
 `--dry-run` renders the first prompt, prints it, and sends nothing. Always the first step
 against a new prompt or a new endpoint.
@@ -59,10 +74,11 @@ what a rule decided, and this repository holds no rules.
 llmjudge/
 ├── llmjudge/
 │   ├── run.py        the judge: endpoint pool, retries, breakers, resume, summary
-│   ├── prompts.py    {column} substitution, and the refusal when a column is missing
+│   ├── template.py   {column} substitution, and the refusal when a column is missing
+│   ├── prompts/<name>/  system.md + user.md — c1, c1r, c2, c2-reason-first, c3,
+│   │                 c3-reasoning, c3-reasoning-2. Inside the package so that pip
+│   │                 install ships them.
 │   └── __main__.py   python3 -m llmjudge
-├── prompts/<name>/   system.md + user.md — c1, c1r, c2, c2-reason-first, c3,
-│                     c3-reasoning, c3-reasoning-2
 ├── configs/endpoints.example.toml    names of env keys, never values
 ├── notebooks/
 │   ├── serve_vllm.py    the Colab cell that serves MedGemma behind a Cloudflare tunnel
@@ -94,12 +110,17 @@ when a step buys nothing, and halves on 429 or timeout. Bounds come from the end
 file; keep `max_concurrency` at or below vLLM's `--max-num-seqs`.
 
 **Preflight.** The whole items file is parsed and checked before a single request goes
-out — ids present and unique, `fields` an object, and the prompt's `{column}` placeholders
-all present — so a pool malformed on line 40,000 costs nothing rather than four hours. Then,
+out — ids present and unique, `fields` an object, and **every row** carrying every
+`{column}` the prompt names — so a pool malformed on line 40,000 costs nothing rather than
+four hours. Field values may be numbers or strings; a number is rendered as it reads. Then,
 per endpoint: `/v1/models` must list the configured model, and a canary request must come
 back sound. Under guided decoding the canary's schema admits one value,
 so a server silently ignoring `response_format` is refused rather than producing a run of
 unconstrained replies.
+
+**No row can hang the run.** Anything raised while rendering or sending a row is recorded
+against that row as an `internal` error and the slot is returned, so one unrenderable row
+costs one row rather than stalling a pool that can never finish.
 
 **Nothing is lost quietly.** A truncated reply (`finish_reason=length`) is recorded as an
 error, never as a verdict. Non-JSON or wrong-key replies are retried once, then recorded
