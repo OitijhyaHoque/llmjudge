@@ -34,9 +34,9 @@ def main(argv: list[str] | None = None) -> int:
     if run_id in (".", "..") or Path(run_id).name != run_id:
         parser.error("--run-id must be a directory name, not a path")
 
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLMJUDGE_API_KEY")
+    api_key = os.environ.get("GPT_API_KEY") or os.environ.get("LLMJUDGE_API_KEY")
     if not api_key and not args.dry_run:
-        parser.error("set OPENAI_API_KEY first")
+        parser.error("set GPT_API_KEY first")
 
     items = sorted(INPUTS.glob("*.csv"))
     if not items:
@@ -50,16 +50,17 @@ def main(argv: list[str] | None = None) -> int:
             items=str(path),
             out=str(out / path.stem),
             run_tag=f"exp_01-{run_id}-{path.stem}",
-            prompt="c1r",
+            prompt="c3",
             base_url="https://api.openai.com/v1",
             api_key=api_key,
             model="gpt-5-mini",
-            guided="off",
+            guided="on",
             max_tokens=4096,
             extra={"reasoning_effort": "medium", "max_completion_tokens": 4096},
             drop=["temperature", "max_tokens"],
             timeout=300,
-            max_requests=25,
+            limit=1000,
+            max_requests=1200,
             dry_run=args.dry_run,
         )
         if code:

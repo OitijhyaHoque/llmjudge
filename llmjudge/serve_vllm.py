@@ -9,6 +9,7 @@
 
 import os
 import re
+import shlex
 import sys
 import time
 import getpass
@@ -19,22 +20,43 @@ import urllib.request
 
 # ============================================================
 # CONFIG
+#
+# Every value below is an env var with a default, so the
+# settings cell of the notebook sets them and this file is
+# never edited -- after a pip install it lives in
+# site-packages, where editing it is no fun at all.
+#
+#   os.environ["LLMJUDGE_SERVE_MODEL"] = "google/medgemma-4b-it"
+#   os.environ["LLMJUDGE_SERVE_NAME"]  = "medgemma-4b-it"
 # ============================================================
 
-# MODEL = "google/medgemma-4b-it"
-MODEL = "google/medgemma-27b-it"
-# SERVED_MODEL = "medgemma-4b-it"
-SERVED_MODEL = "medgemma-27b-it"
 
-PORT = 8000
+def _env(name, default):
+    """LLMJUDGE_SERVE_<name>, typed like `default`. Unset or "" -> `default`."""
+    raw = (os.environ.get(f"LLMJUDGE_SERVE_{name}") or "").strip()
+    if not raw:
+        return default
+    if isinstance(default, bool):
+        return raw.lower() in ("1", "true", "yes", "on")
+    return type(default)(raw)
 
-MAX_MODEL_LEN = 8192
-MAX_NUM_SEQS = 16
+
+MODEL = _env("MODEL", "google/medgemma-27b-it")
+SERVED_MODEL = _env("NAME", "medgemma-27b-it")
+
+PORT = _env("PORT", 8000)
+
+MAX_MODEL_LEN = _env("MAX_MODEL_LEN", 8192)
+MAX_NUM_SEQS = _env("MAX_NUM_SEQS", 16)
 
 # Set to False once you have confirmed the model loads.
 # Eager mode disables CUDA graphs and is meaningfully slower
 # across tens of thousands of requests.
-ENFORCE_EAGER = True
+ENFORCE_EAGER = _env("ENFORCE_EAGER", True)
+
+# Anything else to hand `vllm serve`, as one string:
+#   LLMJUDGE_SERVE_ARGS="--quantization fp8 --swap-space 8"
+EXTRA_ARGS = shlex.split(_env("ARGS", ""))
 
 
 # ============================================================
@@ -246,6 +268,8 @@ cmd = [
 
 if ENFORCE_EAGER:
     cmd.append("--enforce-eager")
+
+cmd += EXTRA_ARGS
 
 
 print("[6/8] Starting MedGemma...\n")
