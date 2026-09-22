@@ -1,5 +1,5 @@
 # ============================================================
-# Serve MedGemma IT with vLLM, behind a Cloudflare tunnel.
+# Serve a chat model with vLLM, behind a Cloudflare tunnel.
 #
 # Run this as one Colab cell. Text only: the vision tower is
 # not loaded. It prints the public URL and a fresh API key,
@@ -48,6 +48,10 @@ PORT = _env("PORT", 8000)
 
 MAX_MODEL_LEN = _env("MAX_MODEL_LEN", 8192)
 MAX_NUM_SEQS = _env("MAX_NUM_SEQS", 16)
+
+# A multimodal checkpoint whose vision tower is not needed (MedGemma, Gemma 3).
+# False for a text-only model such as Qwen3, whose vLLM may reject the flag.
+LANGUAGE_MODEL_ONLY = _env("LANGUAGE_MODEL_ONLY", True)
 
 # Set to False once you have confirmed the model loads.
 # Eager mode disables CUDA graphs and is meaningfully slower
@@ -215,10 +219,10 @@ subprocess.run(
 
 
 # ============================================================
-# 6. START vLLM / MEDGEMMA
+# 6. START vLLM
 # ============================================================
 
-LOG_PATH = "/content/vllm-medgemma.log"
+LOG_PATH = f"/content/vllm-{SERVED_MODEL}.log"
 
 
 # Protects the public endpoint. Generated fresh on every run, so nothing long-lived can
@@ -242,11 +246,6 @@ cmd = [
     SERVED_MODEL,
 
     # ------------------------------------------
-    # We only need text.
-    # ------------------------------------------
-    "--language-model-only",
-
-    # ------------------------------------------
     # Known-working configuration
     # ------------------------------------------
     "--dtype",
@@ -266,13 +265,16 @@ cmd = [
     API_KEY,
 ]
 
+if LANGUAGE_MODEL_ONLY:
+    cmd.append("--language-model-only")          # we only need text
+
 if ENFORCE_EAGER:
     cmd.append("--enforce-eager")
 
 cmd += EXTRA_ARGS
 
 
-print("[6/8] Starting MedGemma...\n")
+print(f"[6/8] Starting {SERVED_MODEL}...\n")
 
 print("Loading model", end="", flush=True)
 
@@ -339,7 +341,7 @@ while True:
     time.sleep(5)
 
 
-print("\n✅ MEDGEMMA LOADED")
+print(f"\n✅ {SERVED_MODEL.upper()} LOADED")
 
 
 # ============================================================
@@ -417,7 +419,7 @@ os.environ["LLMJUDGE_MODEL"] = SERVED_MODEL
 print("\n[8/8] ✅ READY\n")
 
 print("=" * 72)
-print("MEDGEMMA — vLLM — CLOUDFLARE TUNNEL")
+print(f"{SERVED_MODEL.upper()} — vLLM — CLOUDFLARE TUNNEL")
 print("=" * 72)
 
 print(f"""

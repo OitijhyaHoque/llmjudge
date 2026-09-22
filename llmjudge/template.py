@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 import re
 
-PLACEHOLDER = re.compile(r"\{([^{}\s]+)\}")
+# A column name may hold spaces ("Smokes (years)"), but not a newline or a leading or
+# trailing space, so `{ ... }` in prose is still not a placeholder.
+PLACEHOLDER = re.compile(r"\{([^{}\s](?:[^{}\n]*[^{}\s])?)\}")
 INTEGRAL_FLOAT = re.compile(r"^-?\d+\.0+$")
 
 

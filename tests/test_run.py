@@ -457,6 +457,15 @@ class ItemsTests(unittest.TestCase):
                                         {"age": 70, "n": 5.0, "x": None}),
                          "age: 70, n: 5, x: <missing>")
 
+    def test_a_column_name_may_hold_spaces(self):
+        """UCI 383 names columns `Smokes (years)` and `STDs: Number of diagnosis`."""
+        self.assertEqual(cj.render_user("s: {Smokes (years)}, d: {STDs: Number of diagnosis}",
+                                        {"Smokes (years)": 2.0, "STDs: Number of diagnosis": 1}),
+                         "s: 2, d: 1")
+        with self.assertRaises(KeyError):
+            cj.render_user("{Smokes (years)}", {"Smokes": 1})
+        self.assertEqual(cj.render_user("{ not a field }", {}), "{ not a field }")
+
     def test_missing_items_file(self):
         with self.assertRaises(cj.ConfigError):
             cj.load_items("/nonexistent/items.jsonl", 42)
